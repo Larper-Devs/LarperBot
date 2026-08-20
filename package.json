@@ -10,7 +10,9 @@
     "typescript": "^7.0.2"
   },
   "dependencies": {
+    "colorette": "^2.0.20",
     "dotenv": "^17.4.2",
+    "mongoose": "^9.9.3",
     "stoat.js": "^7.3.6"
   }
 }

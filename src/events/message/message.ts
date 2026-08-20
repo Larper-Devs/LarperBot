@@ -30,7 +30,7 @@ export default class extends Event {
             if (!command) return;
             if (command) command.run(this.client, message, args);
         } catch (error) {
-            console.log('Erro em message.js', error)
+            this.logger.error('Erro no processamento de mensagem', error);
         }
     }
 }

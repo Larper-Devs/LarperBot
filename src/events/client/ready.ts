@@ -9,6 +9,6 @@ export default class extends Event {
     }
 
     run = async () => {
-        console.log(`Bot ${this.client.user?.username} logado com sucesso em ${this.client.servers.size()} servidores.`);
+        this.logger.success(`Bot ${this.client.user?.username} logado com sucesso em ${this.client.servers.size()} servidores.`);
     }
 }

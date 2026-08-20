@@ -16,7 +16,6 @@ export default class extends Commands {
     run = async (client: CustomClient, message: Message, args: string[]) => {
         const prefix = process.env.DEFAULT_PREFIX || '!'
 
-        // Se o usuário solicitou detalhes de um comando específico (ex: !help padd)
         if (args.length > 0 && args[0].trim().length > 0) {
             const query = args[0].toLowerCase()
             const cmd = client.commands.find(
@@ -55,7 +54,6 @@ export default class extends Commands {
             })
         }
 
-        // Listagem geral de todos os comandos agrupados por categoria
         const categoriesMap = new Map<string, typeof client.commands>()
 
         for (const cmd of client.commands) {
