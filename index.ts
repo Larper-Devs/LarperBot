@@ -5,6 +5,8 @@ config({ path: '.env' })
 
 const client = new CustomClient()
 
+await client.init()
+
 client.loginBot(`${process.env.TOKEN}`)
 
 process.on('unhandledRejection', (err: { code: string, message: string }, reason: { stack: string | undefined }) => {
