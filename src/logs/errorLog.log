@@ -4,3 +4,12 @@
 [20-08-2026 02:13:07] [SUCCESS] Bot Larper logado com sucesso em 1 servidores.
 [20-08-2026 02:13:32] [SUCCESS] DB Connected!
 [20-08-2026 02:13:33] [SUCCESS] Bot Larper logado com sucesso em 1 servidores.
+[20-08-2026 19:49:52] Invalid scheme, expected connection string to start with "mongodb://" or "mongodb+srv://"-undefined Location: undefined
+[20-08-2026 19:49:53] [SUCCESS] Bot Larper logado com sucesso em 2 servidores.
+[20-08-2026 19:50:01] messages.map is not a function-undefined Location: undefined
+[20-08-2026 19:50:07] messages.map is not a function-undefined Location: undefined
+[20-08-2026 19:51:47] Invalid scheme, expected connection string to start with "mongodb://" or "mongodb+srv://"-undefined Location: undefined
+[20-08-2026 19:51:48] [SUCCESS] Bot Larper logado com sucesso em 2 servidores.
+[20-08-2026 19:53:03] Invalid scheme, expected connection string to start with "mongodb://" or "mongodb+srv://"-undefined Location: undefined
+[20-08-2026 19:53:04] [SUCCESS] Bot Larper logado com sucesso em 2 servidores.
+[20-08-2026 19:53:37] Invalid scheme, expected connection string to start with "mongodb://" or "mongodb+srv://"-undefined Location: undefined
