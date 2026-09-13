@@ -1,6 +1,8 @@
-import { Event } from '../../structures/Event'
-import { CustomClient } from '../../structures/Client'
-import { Message } from 'stoat.js'
+import { Event } from '../../structures/Event.js'
+import { CustomClient } from '../../structures/Client.js'
+import { Message, PermissionFlagsBits } from 'discord.js'
+import { handleMessage as handleAutomod } from '../../services/AutomodService.js'
+import { processMessage as processLevel } from '../../services/LevelService.js'
 
 export default class extends Event {
     constructor(client: CustomClient) {
@@ -9,28 +11,44 @@ export default class extends Event {
         })
     }
 
-  run = async (message: Message) => {
+    run = async (message: Message) => {
         if (message.author?.bot) return;
-        if (message.channel?.type === "DirectMessage") return;
+        if (!message.inGuild()) return;
 
-        const prefix = process.env.DEFAULT_PREFIX
+        if (this.client.automodEnabled) {
+            const moderated = await handleAutomod(this.client, message)
+            if (moderated) return
+        }
+
+        if (this.client.levelsEnabled) {
+            await processLevel(this.client, message)
+        }
+
+        if (!this.client.prefixCommandsEnabled) return;
+
+        const prefix = this.client.prefix;
+        if (!message.content.startsWith(prefix)) return;
 
         try {
-            if (!message.content.toLowerCase().startsWith((<string>prefix))) return;
+            const tokens = message.content.slice(prefix.length).trim().split(/\s+/);
+            const cmd = tokens.shift()?.toLowerCase();
+            const args = tokens.filter(Boolean);
 
-            var args = message.content.slice((<string>prefix).length).split(' ');
-            const cmd = (<string>args.shift()).toLowerCase();
+            if (!cmd) return;
 
-            
-            if (cmd.length === 0) return;
+            const command = this.client.findCommand(cmd);
 
-            const command = this.client.commands.find((c: { name: string }) => c.name == cmd) || this.client.commands.find((a: { aliases: string[] }) => a.aliases && a.aliases.includes(cmd));
-
-            
             if (!command) return;
-            if (command) command.run(this.client, message, args);
+
+            if (command.adminOnly && !message.member?.permissions.has(PermissionFlagsBits.Administrator)) {
+                await message.reply('Apenas administradores podem usar este comando.')
+                return
+            }
+
+            await command.executeMessage(this.client, message, args);
         } catch (error) {
             this.logger.error('Erro no processamento de mensagem', error);
+            await message.reply('Ocorreu um erro ao executar esse comando.').catch(() => undefined);
         }
     }
 }

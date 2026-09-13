@@ -1,23 +1,18 @@
 import { config } from "dotenv";
-import { CustomClient } from "./src/structures/Client";
-import { writeOnLog } from "./src/structures/Logger";
+import { CustomClient } from "./src/structures/Client.js";
+
 config({ path: ".env" });
 
-const originalDebug = console.debug;
-console.debug = (...args: any[]) => {
-  if (typeof args[0] === "string" && args[0].includes("during hydration")) {
-    return;
-  }
-  originalDebug(...args);
-};
+const client = new CustomClient();
 
-new CustomClient(`${process.env.TOKEN}`);
-process.on(
-  "unhandledRejection",
-  (
-    err: { code: string; message: string },
-    reason: { stack: string | undefined },
-  ) => {
-    writeOnLog(`${err.message}-${err.code} Location: ${reason.stack}`);
-  },
-);
+process.on("unhandledRejection", (reason) => {
+  client.logger.error("Promise rejeitada sem tratamento", reason);
+});
+
+process.on("uncaughtException", (error) => {
+  client.logger.fatal("Exceção não capturada", error);
+});
+
+void client.start().catch((error) => {
+  client.logger.fatal("Não foi possível iniciar o bot", error);
+});

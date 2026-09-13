@@ -1,5 +1,5 @@
-import { CustomClient } from './Client'
-import { Logger } from './Logger'
+import { CustomClient } from './Client.js'
+import { Logger } from './Logger.js'
 
 class Event {
 

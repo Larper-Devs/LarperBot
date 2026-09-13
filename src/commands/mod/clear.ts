@@ -1,58 +1,86 @@
-import { Commands } from '../../structures/Commands'
-import { CustomClient } from '../../structures/Client'
-import { Message } from 'stoat.js'
+import {
+    ChatInputCommandInteraction,
+    EmbedBuilder,
+    Message,
+    MessageFlags,
+    PermissionFlagsBits,
+    SlashCommandBuilder,
+} from 'discord.js'
+import { Commands } from '../../structures/Commands.js'
+import { CustomClient } from '../../structures/Client.js'
 
 export default class extends Commands {
     constructor(client: CustomClient) {
         super(client, {
             name: 'clear',
-            description: 'Serve para apagar uma quantidade de mensagens em um chat.',
+            description: 'Apaga mensagens recentes de um canal.',
             aliases: ['mod', 'c'],
             category: 'Moderação',
-            howToUse: 'clear [quantidade]'
+            howToUse: 'clear [quantidade]',
+            data: new SlashCommandBuilder()
+                .setName('clear')
+                .setDescription('Apaga mensagens recentes do canal.')
+                .addIntegerOption((option) => option
+                    .setName('quantidade')
+                    .setDescription('Quantidade de mensagens, entre 1 e 100.')
+                    .setMinValue(1)
+                    .setMaxValue(100)
+                    .setRequired(true)),
         })
     }
 
-    run = async (client: CustomClient, message: Message, args: string[]) => {
-        if (!args[0]) {
-            return message.channel?.sendMessage({
-                embeds: [{
-                    title: '❌ Uso incorreto',
-                    description: 'Use: `clear [quantidade]`',
-                    colour: '#ED4245'
-                }]
-            })
+    async executeMessage(_client: CustomClient, message: Message, args: string[]): Promise<void> {
+        if (!message.member?.permissions.has(PermissionFlagsBits.ManageMessages)) {
+            await message.reply({ embeds: [this.errorEmbed('Você precisa da permissão `Gerenciar Mensagens`.')] })
+            return
         }
 
-        const amount = parseInt(args[0]);
+        const amount = Number.parseInt(args[0] ?? '', 10)
+        if (!Number.isInteger(amount) || amount < 1 || amount > 100) {
+            await message.reply({ embeds: [this.errorEmbed('Use uma quantidade entre 1 e 100.')] })
+            return
+        }
 
-        if (isNaN(amount) || amount < 1 || amount > 100) {
-            return message.channel?.sendMessage({
-                embeds: [{
-                    title: '❌ Quantidade inválida',
-                    description: 'Informe um número entre 1 e 100.',
-                    colour: '#ED4245'
-                }]
-            })
+        if (!message.channel.isTextBased() || !('bulkDelete' in message.channel)) {
+            await message.reply({ embeds: [this.errorEmbed('Este comando só funciona em canais de texto.')] })
+            return
         }
 
         try {
-            const messages = await message.channel?.fetchMessages({
-                limit: amount + 1,
-                sort: 'Latest'
-            });
-
-            const ids = messages!.map((m) => m.id);
-            await message.channel?.deleteMessages(ids);
-        } catch (err) {
-            console.error('Erro ao deletar mensagens:', err);
-            await message.channel?.sendMessage({
-                embeds: [{
-                    title: '❌ Erro',
-                    description: 'Não foi possível deletar as mensagens. Verifique se o bot tem permissão `ManageMessages`.',
-                    colour: '#ED4245'
-                }]
-            })
+            const deleted = await message.channel.bulkDelete(amount, true)
+            const confirmation = await message.channel.send(`🧹 ${deleted.size} mensagem(ns) apagada(s).`)
+            setTimeout(() => confirmation.delete().catch(() => undefined), 3_000)
+        } catch (error) {
+            this.logger.error('Erro ao apagar mensagens', error)
+            await message.reply({ embeds: [this.errorEmbed('Não foi possível apagar as mensagens. Verifique a permissão e se elas têm menos de 14 dias.')] })
         }
+    }
+
+    async executeInteraction(_client: CustomClient, interaction: ChatInputCommandInteraction): Promise<void> {
+        if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageMessages)) {
+            await interaction.reply({ embeds: [this.errorEmbed('Você precisa da permissão `Gerenciar Mensagens`.')], flags: MessageFlags.Ephemeral })
+            return
+        }
+
+        const amount = interaction.options.getInteger('quantidade', true)
+        if (!interaction.channel || !('bulkDelete' in interaction.channel)) {
+            await interaction.reply({ embeds: [this.errorEmbed('Este comando só funciona em canais de texto.')], flags: MessageFlags.Ephemeral })
+            return
+        }
+
+        try {
+            const deleted = await interaction.channel.bulkDelete(amount, true)
+            await interaction.reply({ content: `🧹 ${deleted.size} mensagem(ns) apagada(s).`, flags: MessageFlags.Ephemeral })
+        } catch (error) {
+            this.logger.error('Erro ao apagar mensagens via slash command', error)
+            await interaction.reply({ embeds: [this.errorEmbed('Não foi possível apagar as mensagens.')], flags: MessageFlags.Ephemeral })
+        }
+    }
+
+    private errorEmbed(description: string): EmbedBuilder {
+        return new EmbedBuilder()
+            .setTitle('Erro')
+            .setDescription(description)
+            .setColor(0xed4245)
     }
 }

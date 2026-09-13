@@ -1,14 +1,16 @@
-import { Event } from '../../structures/Event'
-import { CustomClient } from '../../structures/Client'
+import { Event } from '../../structures/Event.js'
+import { CustomClient } from '../../structures/Client.js'
 
 export default class extends Event {
     constructor(client: CustomClient) {
         super(client, {
-            name: 'ready'
+            name: 'clientReady'
         })
     }
 
     run = async () => {
-        this.logger.success(`Bot ${this.client.user?.username} logado com sucesso em ${this.client.servers.size()} servidores.`);
+        this.logger.success(
+            `Bot ${this.client.user?.tag ?? 'desconhecido'} online em ${this.client.guilds.cache.size} servidor(es). Slash commands são o modo principal.`,
+        );
     }
 }
