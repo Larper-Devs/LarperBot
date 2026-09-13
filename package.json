@@ -2,7 +2,9 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch index.ts",
-    "build": "tsc"
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "deploy:commands": "tsx src/deploy-commands.ts"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",
@@ -10,9 +12,10 @@
     "typescript": "^7.0.2"
   },
   "dependencies": {
+    "@napi-rs/canvas": "1.0.9",
     "colorette": "^2.0.20",
+    "discord.js": "^14.27.0",
     "dotenv": "^17.4.2",
-    "mongoose": "^9.9.3",
-    "stoat.js": "^7.3.6"
+    "mongoose": "^9.9.3"
   }
 }
