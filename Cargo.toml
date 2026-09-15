@@ -1,0 +1,24 @@
+[package]
+name = "larperbot"
+version = "1.0.0"
+edition = "2021"
+description = "LarperBot em Rust para deploy enxuto na Discloud"
+
+[dependencies]
+dotenvy = "0.15"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serenity = { version = "0.12", default-features = false, features = ["builder", "client", "gateway", "model", "rustls_backend"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+[profile.release]
+opt-level = "z"
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
