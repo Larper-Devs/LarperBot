@@ -51,6 +51,20 @@ cargo run
 
 O bot aceita `DISCORD_TOKEN` ou `TOKEN`. `GUILD_ID` registra os comandos imediatamente nesse servidor; sem ele, o registro é global. As variáveis `ENABLE_PREFIX_COMMANDS`, `ENABLE_AUTOMOD`, `ENABLE_LEVELS` e `ENABLE_MEMBER_EVENTS` continuam funcionando. O banco local é `./larperbot.sqlite` e pode ser alterado com `DATABASE_PATH`.
 
+## Render
+
+O processo também mantém um servidor HTTP leve com as rotas `/`, `/health` e `/healthz`. Ele escuta em `0.0.0.0:$PORT`, que é a porta fornecida pelo Render, e roda em paralelo ao bot do Discord. Se `PORT` não existir, a execução local usa `10000`.
+
+Configure o serviço do Render como **Web Service** e use, por exemplo:
+
+```text
+Build Command: cargo build --release
+Start Command: ./target/release/larperbot
+Health Check Path: /healthz
+```
+
+Não é necessário simular requisições internamente: o endpoint permite que o Render verifique o serviço. Em planos com suspensão por inatividade, um ping interno não garante disponibilidade contínua; para uptime permanente, é necessário um plano que não suspenda o serviço ou um monitor externo autorizado.
+
 ## Build de produção
 
 ```bash

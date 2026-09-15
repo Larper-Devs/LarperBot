@@ -1,5 +1,6 @@
 #![allow(clippy::too_many_arguments)]
 
+use axum::{routing::get, Router};
 use rand::Rng;
 use reqwest::Client as HttpClient;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -10,6 +11,7 @@ use std::collections::HashMap;
 use std::env;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::net::TcpListener;
 use tokio::time::sleep;
 use tracing::{error, info};
 
@@ -19,6 +21,32 @@ const PURPLE: u32 = 0x8B5CF6;
 const GREEN: u32 = 0x2ECC71;
 const RED: u32 = 0xED4245;
 const BLUE: u32 = 0x5865F2;
+const DEFAULT_HTTP_PORT: u16 = 10_000;
+
+async fn health_check() -> &'static str {
+    "LarperBot online"
+}
+
+fn health_router() -> Router {
+    Router::new()
+        .route("/", get(health_check))
+        .route("/health", get(health_check))
+        .route("/healthz", get(health_check))
+}
+
+async fn run_health_server(listener: TcpListener) -> BotResult<()> {
+    axum::serve(listener, health_router()).await?;
+    Ok(())
+}
+
+fn http_port() -> Result<u16, String> {
+    match env::var("PORT") {
+        Ok(value) => value
+            .parse::<u16>()
+            .map_err(|_| format!("PORT inválida: {value}")),
+        Err(_) => Ok(DEFAULT_HTTP_PORT),
+    }
+}
 
 #[derive(Clone)]
 struct Config {
@@ -3833,17 +3861,53 @@ async fn main() -> BotResult<()> {
     let mut client = Client::builder(&config.token, intents)
         .event_handler(Handler { state })
         .await?;
+
+    let port = http_port()?;
+    let listener = TcpListener::bind(("0.0.0.0", port)).await?;
+    let mut health_server = tokio::spawn(run_health_server(listener));
     info!(
-        "Iniciando LarperBot em Rust; banco SQLite em {}",
-        config.database_path
+        "Iniciando LarperBot em Rust; banco SQLite em {}; health check em 0.0.0.0:{port}",
+        config.database_path,
     );
-    client.start().await?;
-    Ok(())
+
+    tokio::select! {
+        bot_result = client.start() => {
+            health_server.abort();
+            let _ = health_server.await;
+            bot_result?;
+            Ok(())
+        }
+        health_result = &mut health_server => {
+            match health_result {
+                Ok(Ok(())) => Err("O servidor HTTP de saúde encerrou inesperadamente.".into()),
+                Ok(Err(error)) => Err(error),
+                Err(error) => Err(error.into()),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn health_server_answers_health_checks() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(run_health_server(listener));
+
+        let response = HttpClient::new()
+            .get(format!("http://{address}/healthz"))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        assert_eq!(response.text().await.unwrap(), "LarperBot online");
+
+        server.abort();
+        let _ = server.await;
+    }
 
     #[test]
     fn duration_accepts_supported_units_and_limit() {
