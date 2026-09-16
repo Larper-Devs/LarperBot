@@ -1,19 +1,29 @@
 #![allow(clippy::too_many_arguments)]
 
+mod mongo_sync;
+mod profile_card;
+
 use axum::{routing::get, Router};
+use mongo_sync::{CacheRecord, MongoSync, SYNC_INTERVAL};
+use profile_card::{
+    is_profile_theme, render_profile_card, render_ranking_card, ProfileCardInput, RankingCardInput,
+    RankingEntry, PROFILE_THEMES,
+};
 use rand::Rng;
 use reqwest::Client as HttpClient;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use serenity::all::*;
 use serenity::async_trait;
+use serenity::http::{LightMethod, Request, Route};
 use std::collections::HashMap;
 use std::env;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
-use tokio::time::sleep;
-use tracing::{error, info};
+use tokio::time::{sleep, timeout};
+use tracing::{debug, error, info};
 
 type BotResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -22,6 +32,26 @@ const GREEN: u32 = 0x2ECC71;
 const RED: u32 = 0xED4245;
 const BLUE: u32 = 0x5865F2;
 const DEFAULT_HTTP_PORT: u16 = 10_000;
+const DEFAULT_UNVERIFIED_ROLE_ID: u64 = 918_519_844_020_830_236;
+const VERIFIED_ROLE_ID: u64 = 918_519_844_020_830_235;
+const CAPTCHA_CHANNEL_ID: u64 = 918_519_844_591_255_613;
+const PUNISHMENT_LOG_CHANNEL_ID: u64 = 918_519_846_461_923_329;
+const COMPONENTS_V2_FLAG: u64 = 1 << 15;
+const CAPTCHA_WARNING: &str = "Não mande mensagens aqui ou você será retirado do servidor!\n\nDo not send messages here or you will be removed from the server!";
+const COLOR_ROLE_NAMES: &[&str] = &[
+    "Vermelho",
+    "Branco",
+    "Preto",
+    "Vermelho Vinho",
+    "Rosa",
+    "Amarelo",
+    "Verde",
+    "Verde Escuro",
+    "Azul",
+    "Roxo",
+    "Laranja",
+    "Marrom",
+];
 
 async fn health_check() -> &'static str {
     "LarperBot online"
@@ -56,7 +86,9 @@ struct Config {
     automod: bool,
     levels: bool,
     member_events: bool,
+    unverified_role_id: RoleId,
     database_path: String,
+    mongo_uri: Option<String>,
 }
 
 impl Config {
@@ -72,18 +104,30 @@ impl Config {
             prefix: env::var("DEFAULT_PREFIX").unwrap_or_else(|_| "!".into()),
             prefix_commands: env_bool("ENABLE_PREFIX_COMMANDS"),
             automod: env_bool("ENABLE_AUTOMOD"),
-            levels: env_bool("ENABLE_LEVELS"),
+            levels: env_bool_default("ENABLE_LEVELS", true),
             member_events: env_bool("ENABLE_MEMBER_EVENTS"),
+            unverified_role_id: env::var("UNVERIFIED_ROLE_ID")
+                .unwrap_or_else(|_| DEFAULT_UNVERIFIED_ROLE_ID.to_string())
+                .parse::<u64>()
+                .map(RoleId::new)
+                .map_err(|_| "UNVERIFIED_ROLE_ID precisa ser um ID numérico válido.".to_string())?,
             database_path: env::var("DATABASE_PATH")
                 .unwrap_or_else(|_| "./larperbot.sqlite".into()),
+            mongo_uri: env::var("MONGO_URI")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
         })
     }
 }
 
 fn env_bool(name: &str) -> bool {
+    env_bool_default(name, false)
+}
+
+fn env_bool_default(name: &str, default: bool) -> bool {
     env::var(name)
         .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+        .unwrap_or(default)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,7 +215,7 @@ impl Default for GuildSettings {
             leave_channel: None,
             leave_message: "{username} saiu do servidor.".into(),
             auto_role: None,
-            level_enabled: false,
+            level_enabled: true,
             xp_cooldown: 60,
             xp_min: 15,
             xp_max: 25,
@@ -326,6 +370,432 @@ impl Db {
         self.conn.execute("INSERT INTO warnings(guild_id,target_id,target_tag,moderator_id,reason,created_at) VALUES(?1,?2,?3,?4,?5,?6)", params![guild_id,target_id,target_tag,moderator_id,reason,now()])?;
         Ok(self.conn.last_insert_rowid())
     }
+
+    fn cache_snapshot(&self) -> rusqlite::Result<Vec<CacheRecord>> {
+        let mut records = Vec::new();
+
+        {
+            let mut statement = self.conn.prepare(
+                "SELECT guild_id,user_id,username,wallet,bank,total_xp,weekly_xp,monthly_xp,
+                        week_key,month_key,last_xp_at,last_daily_at,last_work_at,afk_message,
+                        profile_background,inventory
+                 FROM profiles",
+            )?;
+            let rows = statement.query_map([], |row| {
+                let guild_id: String = row.get(0)?;
+                let user_id: String = row.get(1)?;
+                let data = mongodb::bson::doc! {
+                    "guild_id": &guild_id,
+                    "user_id": &user_id,
+                    "username": row.get::<_, String>(2)?,
+                    "wallet": row.get::<_, i64>(3)?,
+                    "bank": row.get::<_, i64>(4)?,
+                    "total_xp": row.get::<_, i64>(5)?,
+                    "weekly_xp": row.get::<_, i64>(6)?,
+                    "monthly_xp": row.get::<_, i64>(7)?,
+                    "week_key": row.get::<_, String>(8)?,
+                    "month_key": row.get::<_, String>(9)?,
+                    "last_xp_at": row.get::<_, i64>(10)?,
+                    "last_daily_at": row.get::<_, i64>(11)?,
+                    "last_work_at": row.get::<_, i64>(12)?,
+                    "afk_message": bson_optional_string(row.get::<_, Option<String>>(13)?),
+                    "profile_background": row.get::<_, String>(14)?,
+                    "inventory": row.get::<_, String>(15)?,
+                };
+                Ok(CacheRecord {
+                    id: format!("profiles:{guild_id}:{user_id}"),
+                    table: "profiles".to_string(),
+                    data,
+                })
+            })?;
+            for row in rows {
+                records.push(row?);
+            }
+        }
+
+        {
+            let mut statement = self
+                .conn
+                .prepare("SELECT guild_id,data FROM guild_settings")?;
+            let rows = statement.query_map([], |row| {
+                let guild_id: String = row.get(0)?;
+                Ok(CacheRecord {
+                    id: format!("guild_settings:{guild_id}"),
+                    table: "guild_settings".to_string(),
+                    data: mongodb::bson::doc! {
+                        "guild_id": &guild_id,
+                        "data": row.get::<_, String>(1)?,
+                    },
+                })
+            })?;
+            for row in rows {
+                records.push(row?);
+            }
+        }
+
+        {
+            let mut statement = self.conn.prepare(
+                "SELECT id,guild_id,user_id,from_user,to_user,kind,amount,reason,created_at
+                 FROM transactions",
+            )?;
+            let rows = statement.query_map([], |row| {
+                let id: i64 = row.get(0)?;
+                Ok(CacheRecord {
+                    id: format!("transactions:{id}"),
+                    table: "transactions".to_string(),
+                    data: mongodb::bson::doc! {
+                        "id": id,
+                        "guild_id": row.get::<_, String>(1)?,
+                        "user_id": row.get::<_, String>(2)?,
+                        "from_user": bson_optional_string(row.get::<_, Option<String>>(3)?),
+                        "to_user": bson_optional_string(row.get::<_, Option<String>>(4)?),
+                        "kind": row.get::<_, String>(5)?,
+                        "amount": row.get::<_, i64>(6)?,
+                        "reason": row.get::<_, String>(7)?,
+                        "created_at": row.get::<_, i64>(8)?,
+                    },
+                })
+            })?;
+            for row in rows {
+                records.push(row?);
+            }
+        }
+
+        {
+            let mut statement = self.conn.prepare(
+                "SELECT id,guild_id,user_id,channel_id,message,remind_at,sent FROM reminders",
+            )?;
+            let rows = statement.query_map([], |row| {
+                let id: i64 = row.get(0)?;
+                Ok(CacheRecord {
+                    id: format!("reminders:{id}"),
+                    table: "reminders".to_string(),
+                    data: mongodb::bson::doc! {
+                        "id": id,
+                        "guild_id": row.get::<_, String>(1)?,
+                        "user_id": row.get::<_, String>(2)?,
+                        "channel_id": row.get::<_, String>(3)?,
+                        "message": row.get::<_, String>(4)?,
+                        "remind_at": row.get::<_, i64>(5)?,
+                        "sent": row.get::<_, i64>(6)?,
+                    },
+                })
+            })?;
+            for row in rows {
+                records.push(row?);
+            }
+        }
+
+        {
+            let mut statement = self.conn.prepare(
+                "SELECT id,guild_id,target_id,target_tag,moderator_id,reason,created_at FROM warnings",
+            )?;
+            let rows = statement.query_map([], |row| {
+                let id: i64 = row.get(0)?;
+                Ok(CacheRecord {
+                    id: format!("warnings:{id}"),
+                    table: "warnings".to_string(),
+                    data: mongodb::bson::doc! {
+                        "id": id,
+                        "guild_id": row.get::<_, String>(1)?,
+                        "target_id": row.get::<_, String>(2)?,
+                        "target_tag": row.get::<_, String>(3)?,
+                        "moderator_id": row.get::<_, String>(4)?,
+                        "reason": row.get::<_, String>(5)?,
+                        "created_at": row.get::<_, i64>(6)?,
+                    },
+                })
+            })?;
+            for row in rows {
+                records.push(row?);
+            }
+        }
+
+        {
+            let mut statement = self.conn.prepare(
+                "SELECT id,guild_id,platform,url,title,added_by,likes,reposts,share_count FROM reels",
+            )?;
+            let rows = statement.query_map([], |row| {
+                let id: i64 = row.get(0)?;
+                Ok(CacheRecord {
+                    id: format!("reels:{id}"),
+                    table: "reels".to_string(),
+                    data: mongodb::bson::doc! {
+                        "id": id,
+                        "guild_id": row.get::<_, String>(1)?,
+                        "platform": row.get::<_, String>(2)?,
+                        "url": row.get::<_, String>(3)?,
+                        "title": row.get::<_, String>(4)?,
+                        "added_by": row.get::<_, String>(5)?,
+                        "likes": row.get::<_, String>(6)?,
+                        "reposts": row.get::<_, String>(7)?,
+                        "share_count": row.get::<_, i64>(8)?,
+                    },
+                })
+            })?;
+            for row in rows {
+                records.push(row?);
+            }
+        }
+
+        Ok(records)
+    }
+
+    fn restore_cache(&mut self, records: &[CacheRecord]) -> rusqlite::Result<usize> {
+        let tx = self.conn.transaction()?;
+        let mut restored = 0;
+
+        for record in records {
+            let data = &record.data;
+            match record.table.as_str() {
+                "profiles" => {
+                    tx.execute(
+                        "INSERT INTO profiles(
+                           guild_id,user_id,username,wallet,bank,total_xp,weekly_xp,monthly_xp,
+                           week_key,month_key,last_xp_at,last_daily_at,last_work_at,afk_message,
+                           profile_background,inventory
+                         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+                         ON CONFLICT(guild_id,user_id) DO UPDATE SET
+                           username=excluded.username,wallet=excluded.wallet,bank=excluded.bank,
+                           total_xp=excluded.total_xp,weekly_xp=excluded.weekly_xp,monthly_xp=excluded.monthly_xp,
+                           week_key=excluded.week_key,month_key=excluded.month_key,last_xp_at=excluded.last_xp_at,
+                           last_daily_at=excluded.last_daily_at,last_work_at=excluded.last_work_at,
+                           afk_message=excluded.afk_message,profile_background=excluded.profile_background,
+                           inventory=excluded.inventory",
+                        params![
+                            cache_string(data, "guild_id"),
+                            cache_string(data, "user_id"),
+                            cache_string(data, "username"),
+                            cache_number(data, "wallet"),
+                            cache_number(data, "bank"),
+                            cache_number(data, "total_xp"),
+                            cache_number(data, "weekly_xp"),
+                            cache_number(data, "monthly_xp"),
+                            cache_string(data, "week_key"),
+                            cache_string(data, "month_key"),
+                            cache_number(data, "last_xp_at"),
+                            cache_number(data, "last_daily_at"),
+                            cache_number(data, "last_work_at"),
+                            cache_optional_string(data, "afk_message"),
+                            cache_string_or(data, "profile_background", "midnight"),
+                            cache_string_or(data, "inventory", "[]"),
+                        ],
+                    )?;
+                }
+                "guild_settings" => {
+                    tx.execute(
+                        "INSERT INTO guild_settings(guild_id,data) VALUES(?1,?2)
+                         ON CONFLICT(guild_id) DO UPDATE SET data=excluded.data",
+                        params![cache_string(data, "guild_id"), cache_string(data, "data")],
+                    )?;
+                }
+                "transactions" => {
+                    tx.execute(
+                        "INSERT INTO transactions(id,guild_id,user_id,from_user,to_user,kind,amount,reason,created_at)
+                         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+                         ON CONFLICT(id) DO UPDATE SET guild_id=excluded.guild_id,user_id=excluded.user_id,
+                           from_user=excluded.from_user,to_user=excluded.to_user,kind=excluded.kind,
+                           amount=excluded.amount,reason=excluded.reason,created_at=excluded.created_at",
+                        params![
+                            cache_number(data, "id"),
+                            cache_string(data, "guild_id"),
+                            cache_string(data, "user_id"),
+                            cache_optional_string(data, "from_user"),
+                            cache_optional_string(data, "to_user"),
+                            cache_string(data, "kind"),
+                            cache_number(data, "amount"),
+                            cache_string(data, "reason"),
+                            cache_number(data, "created_at"),
+                        ],
+                    )?;
+                }
+                "reminders" => {
+                    tx.execute(
+                        "INSERT INTO reminders(id,guild_id,user_id,channel_id,message,remind_at,sent)
+                         VALUES(?1,?2,?3,?4,?5,?6,?7)
+                         ON CONFLICT(id) DO UPDATE SET guild_id=excluded.guild_id,user_id=excluded.user_id,
+                           channel_id=excluded.channel_id,message=excluded.message,remind_at=excluded.remind_at,
+                           sent=excluded.sent",
+                        params![
+                            cache_number(data, "id"),
+                            cache_string(data, "guild_id"),
+                            cache_string(data, "user_id"),
+                            cache_string(data, "channel_id"),
+                            cache_string(data, "message"),
+                            cache_number(data, "remind_at"),
+                            cache_number(data, "sent"),
+                        ],
+                    )?;
+                }
+                "warnings" => {
+                    tx.execute(
+                        "INSERT INTO warnings(id,guild_id,target_id,target_tag,moderator_id,reason,created_at)
+                         VALUES(?1,?2,?3,?4,?5,?6,?7)
+                         ON CONFLICT(id) DO UPDATE SET guild_id=excluded.guild_id,target_id=excluded.target_id,
+                           target_tag=excluded.target_tag,moderator_id=excluded.moderator_id,
+                           reason=excluded.reason,created_at=excluded.created_at",
+                        params![
+                            cache_number(data, "id"),
+                            cache_string(data, "guild_id"),
+                            cache_string(data, "target_id"),
+                            cache_string(data, "target_tag"),
+                            cache_string(data, "moderator_id"),
+                            cache_string(data, "reason"),
+                            cache_number(data, "created_at"),
+                        ],
+                    )?;
+                }
+                "reels" => {
+                    tx.execute(
+                        "INSERT INTO reels(id,guild_id,platform,url,title,added_by,likes,reposts,share_count)
+                         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+                         ON CONFLICT(id) DO UPDATE SET guild_id=excluded.guild_id,platform=excluded.platform,
+                           url=excluded.url,title=excluded.title,added_by=excluded.added_by,likes=excluded.likes,
+                           reposts=excluded.reposts,share_count=excluded.share_count",
+                        params![
+                            cache_number(data, "id"),
+                            cache_string(data, "guild_id"),
+                            cache_string(data, "platform"),
+                            cache_string(data, "url"),
+                            cache_string(data, "title"),
+                            cache_string(data, "added_by"),
+                            cache_string_or(data, "likes", "[]"),
+                            cache_string_or(data, "reposts", "[]"),
+                            cache_number(data, "share_count"),
+                        ],
+                    )?;
+                }
+                _ => continue,
+            }
+            restored += 1;
+        }
+
+        tx.commit()?;
+        Ok(restored)
+    }
+}
+
+fn bson_optional_string(value: Option<String>) -> mongodb::bson::Bson {
+    value
+        .map(mongodb::bson::Bson::String)
+        .unwrap_or(mongodb::bson::Bson::Null)
+}
+
+fn cache_string(data: &mongodb::bson::Document, key: &str) -> String {
+    data.get_str(key).unwrap_or_default().to_string()
+}
+
+fn cache_string_or(data: &mongodb::bson::Document, key: &str, default: &str) -> String {
+    let value = cache_string(data, key);
+    if value.is_empty() {
+        default.to_string()
+    } else {
+        value
+    }
+}
+
+fn cache_optional_string(data: &mongodb::bson::Document, key: &str) -> Option<String> {
+    data.get_str(key).ok().map(str::to_owned)
+}
+
+fn cache_number(data: &mongodb::bson::Document, key: &str) -> i64 {
+    match data.get(key) {
+        Some(mongodb::bson::Bson::Int32(value)) => i64::from(*value),
+        Some(mongodb::bson::Bson::Int64(value)) => *value,
+        Some(mongodb::bson::Bson::Double(value)) => *value as i64,
+        _ => 0,
+    }
+}
+
+async fn push_local_cache(sync: &MongoSync, state: &Arc<State>, reason: &str) {
+    let snapshot = {
+        let db = state.db();
+        match db.cache_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                error!("Falha ao criar snapshot do cache local ({reason}): {error}");
+                return;
+            }
+        }
+    };
+
+    match sync.push_snapshot(&snapshot).await {
+        Ok(count) => info!("Cache local enviado ao MongoDB ({reason}): {count} registro(s)."),
+        Err(error) => {
+            error!("Falha ao enviar cache local ao MongoDB ({reason}); haverá retry: {error}")
+        }
+    }
+}
+
+async fn load_remote_cache(sync: &MongoSync, state: &Arc<State>, reason: &str) -> bool {
+    let records = match timeout(Duration::from_secs(30), sync.load_snapshot()).await {
+        Ok(Ok(records)) => records,
+        Ok(Err(error)) => {
+            error!("Falha ao carregar o MongoDB ({reason}); cache local preservado: {error}");
+            return false;
+        }
+        Err(_) => {
+            error!("Timeout ao carregar o MongoDB ({reason}); cache local preservado.");
+            return false;
+        }
+    };
+
+    let restore_result = {
+        let mut db = state.db();
+        db.restore_cache(&records)
+    };
+    match restore_result {
+        Ok(restored) => {
+            info!("Cache local carregado do MongoDB ({reason}): {restored} registro(s).");
+            true
+        }
+        Err(error) => {
+            error!(
+                "Falha ao gravar o snapshot do MongoDB no cache local ({reason}); carga rejeitada: {error}"
+            );
+            false
+        }
+    }
+}
+
+async fn mongo_sync_loop(
+    uri: String,
+    state: Arc<State>,
+    mut sync: Option<MongoSync>,
+    mut cache_loaded: bool,
+) {
+    loop {
+        sleep(SYNC_INTERVAL).await;
+
+        if sync.is_none() {
+            match timeout(Duration::from_secs(20), MongoSync::connect(&uri)).await {
+                Ok(Ok(connected)) => {
+                    info!("MongoDB reconectado; retomando sincronização do cache local.");
+                    sync = Some(connected);
+                    cache_loaded = false;
+                }
+                Ok(Err(error)) => {
+                    error!("Retry do MongoDB falhou; cache local continua ativo: {error}");
+                    continue;
+                }
+                Err(_) => {
+                    error!("Timeout no retry de conexão com MongoDB; cache local continua ativo.");
+                    continue;
+                }
+            }
+        }
+
+        if let Some(connected) = sync.as_ref() {
+            if !cache_loaded {
+                if !load_remote_cache(connected, &state, "retry da carga inicial").await {
+                    sync = None;
+                    continue;
+                }
+                cache_loaded = true;
+            }
+            push_local_cache(connected, &state, "sincronização periódica").await;
+        }
+    }
 }
 
 struct State {
@@ -335,6 +805,7 @@ struct State {
     spam: Mutex<HashMap<String, Vec<Instant>>>,
     resume: Mutex<HashMap<UserId, (Instant, u8)>>,
     blackjack: Mutex<HashMap<String, BlackjackGame>>,
+    bot_id: Mutex<Option<UserId>>,
 }
 
 #[derive(Clone)]
@@ -357,6 +828,7 @@ struct Handler {
 #[async_trait]
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
+        *self.state.bot_id.lock().expect("bot id mutex poisoned") = Some(ready.user.id);
         info!(
             "Bot {} online em {} servidor(es).",
             ready.user.name,
@@ -396,6 +868,10 @@ impl EventHandler for Handler {
     }
 
     async fn message(&self, ctx: Context, message: Message) {
+        if message.channel_id == ChannelId::new(CAPTCHA_CHANNEL_ID) {
+            handle_captcha_message(&ctx, &self.state, &message).await;
+            return;
+        }
         if message.author.bot {
             return;
         }
@@ -422,37 +898,70 @@ impl EventHandler for Handler {
         }
     }
 
+    async fn guild_audit_log_entry_create(
+        &self,
+        ctx: Context,
+        entry: AuditLogEntry,
+        guild_id: GuildId,
+    ) {
+        handle_audit_log_entry(&ctx, &self.state, entry, guild_id).await;
+    }
+
     async fn guild_member_addition(&self, ctx: Context, member: Member) {
         if !self.state.config.member_events {
             return;
         }
-        let Ok(settings) = self.state.db().settings(&member.guild_id.to_string()) else {
-            return;
+        info!(
+            "Novo membro detectado: {} entrou no servidor {}.",
+            member.user.name, member.guild_id
+        );
+
+        let settings = {
+            let db = self.state.db();
+            db.settings(&member.guild_id.to_string())
         };
-        if !settings.welcome_enabled {
-            return;
+        match settings {
+            Ok(settings) if settings.welcome_enabled => {
+                if let Some(channel) = settings
+                    .welcome_channel
+                    .and_then(|id| id.parse::<u64>().ok())
+                    .map(ChannelId::new)
+                {
+                    let content = replace_placeholders(
+                        &settings.welcome_message,
+                        &[
+                            ("mention", member.user.mention().to_string()),
+                            ("server", member.guild_id.to_string()),
+                            ("memberCount", "".into()),
+                        ],
+                    );
+                    if let Err(error) = channel.say(&ctx.http, content).await {
+                        error!(
+                            "Falha ao enviar boas-vindas para {}: {error}",
+                            member.user.name
+                        );
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                error!(
+                    "Falha ao ler configurações de entrada do servidor {}: {error}",
+                    member.guild_id
+                );
+            }
         }
-        if let Some(channel) = settings
-            .welcome_channel
-            .and_then(|id| id.parse::<u64>().ok())
-            .map(ChannelId::new)
-        {
-            let content = replace_placeholders(
-                &settings.welcome_message,
-                &[
-                    ("mention", member.user.mention().to_string()),
-                    ("server", member.guild_id.to_string()),
-                    ("memberCount", "".into()),
-                ],
-            );
-            let _ = channel.say(&ctx.http, content).await;
-        }
-        if let Some(role) = settings
-            .auto_role
-            .and_then(|id| id.parse::<u64>().ok())
-            .map(RoleId::new)
-        {
-            let _ = member.add_role(&ctx.http, role).await;
+
+        let role = self.state.config.unverified_role_id;
+        match member.add_role(&ctx.http, role).await {
+            Ok(()) => info!(
+                "Cargo não verificado {} atribuído a {} no servidor {}.",
+                role, member.user.name, member.guild_id
+            ),
+            Err(error) => error!(
+                "Falha ao atribuir o cargo não verificado {} para {} no servidor {}: {error}.",
+                role, member.user.name, member.guild_id
+            ),
         }
     }
 
@@ -546,9 +1055,18 @@ fn sub(name: &str, description: &str, options: Vec<CreateCommandOption>) -> Crea
 }
 
 fn command_definitions() -> Vec<CreateCommand> {
+    let profile_theme_option = PROFILE_THEMES.iter().fold(
+        opt(
+            CommandOptionType::String,
+            "tema",
+            "Tema visual do perfil.",
+            true,
+        ),
+        |option, (value, label)| option.add_string_choice(*label, *value),
+    );
     let c = vec![
         CreateCommand::new("help")
-            .description("Lista os comandos do bot.")
+            .description("Abre a central de ajuda por categoria.")
             .add_option(opt(
                 CommandOptionType::String,
                 "comando",
@@ -613,13 +1131,7 @@ fn command_definitions() -> Vec<CreateCommand> {
         ),
         admin(
             CreateCommand::new("captcha")
-                .description("Publica o painel de verificação.")
-                .add_option(opt(
-                    CommandOptionType::Channel,
-                    "canal",
-                    "Canal do painel.",
-                    false,
-                )),
+                .description("Publica o aviso e ativa a proteção do canal #captcha."),
         ),
         admin(
             CreateCommand::new("tech")
@@ -912,8 +1424,16 @@ fn command_definitions() -> Vec<CreateCommand> {
                 false,
             )),
         CreateCommand::new("profile")
-            .description("Exibe seu perfil.")
-            .add_option(opt(CommandOptionType::User, "usuario", "Usuário.", false)),
+            .description("Gera seu perfil visual com XP, nível e economia.")
+            .add_option(opt(
+                CommandOptionType::User,
+                "usuario",
+                "Usuário consultado.",
+                false,
+            )),
+        CreateCommand::new("profile-config")
+            .description("Configura o tema do seu perfil visual.")
+            .add_option(profile_theme_option),
         admin(
             CreateCommand::new("level-config")
                 .description("Configura níveis.")
@@ -1116,6 +1636,864 @@ fn admin_command(name: &str) -> bool {
     )
 }
 
+#[derive(Clone, Copy)]
+struct HelpCommand {
+    name: &'static str,
+    description: &'static str,
+    category: &'static str,
+    aliases: &'static [&'static str],
+    admin_only: bool,
+}
+
+const HELP_COMMANDS: &[HelpCommand] = &[
+    HelpCommand {
+        name: "help",
+        description: "Abre a central de ajuda por categoria.",
+        category: "Informação",
+        aliases: &["ajuda", "h"],
+        admin_only: false,
+    },
+    HelpCommand {
+        name: "ping",
+        description: "Exibe a latência do bot.",
+        category: "Informação",
+        aliases: &[],
+        admin_only: false,
+    },
+    HelpCommand {
+        name: "avatar",
+        description: "Exibe o avatar de um usuário.",
+        category: "Informação",
+        aliases: &[],
+        admin_only: false,
+    },
+    HelpCommand {
+        name: "userinfo",
+        description: "Exibe informações de um usuário.",
+        category: "Informação",
+        aliases: &[],
+        admin_only: false,
+    },
+    HelpCommand {
+        name: "serverinfo",
+        description: "Exibe informações do servidor.",
+        category: "Informação",
+        aliases: &[],
+        admin_only: false,
+    },
+    HelpCommand {
+        name: "calc",
+        description: "Calcula uma expressão com segurança.",
+        category: "Utilitários",
+        aliases: &[],
+        admin_only: false,
+    },
+    HelpCommand {
+        name: "devex",
+        description: "Calcula o valor estimado de Robux.",
+        category: "Utilitários",
+        aliases: &[],
+        admin_only: false,
+    },
+    HelpCommand {
+        name: "resume",
+        description: "Resume o conteúdo de um site.",
+        category: "Utilitários",
+        aliases: &[],
+        admin_only: false,
+    },
+    HelpCommand {
+        name: "verify",
+        description: "Publica o painel de verificação.",
+        category: "Utilitários",
+        aliases: &[],
+        admin_only: true,
+    },
+    HelpCommand {
+        name: "captcha",
+        description: "Publica o aviso e ativa a proteção do canal #captcha.",
+        category: "Utilitários",
+        aliases: &[],
+        admin_only: true,
+    },
+    HelpCommand {
+        name: "tech",
+        description: "Publica o painel de tecnologias.",
+        category: "Utilitários",
+        aliases: &[],
+        admin_only: true,
+    },
+    HelpCommand {
+        name: "cores",
+        description: "Publica o painel de cores.",
+        category: "Utilitários",
+        aliases: &[],
+        admin_only: true,
+    },
+    HelpCommand {
+        name: "ticket",
+        description: "Publica o painel de tickets.",
+        category: "Utilitários",
+        aliases: &[],
+        admin_only: true,
+    },
+    HelpCommand {
+        name: "reels",
+        description: "Exibe um Reel cadastrado.",
+        category: "Utilitários",
+        aliases: &[],
+        admin_only: false,
+    },
+    HelpCommand {
+        name: "tkk",
+        description: "Exibe um TikTok cadastrado.",
+        category: "Utilitários",
+        aliases: &[],
+        admin_only: false,
+    },
+    HelpCommand {
+        name: "feed",
+        description: "Administra o feed de vídeos.",
+        category: "Utilitários",
+        aliases: &[],
+        admin_only: true,
+    },
+    HelpCommand {
+        name: "novidades",
+        description: "Publica uma novidade.",
+        category: "Utilitários",
+        aliases: &[],
+        admin_only: true,
+    },
+    HelpCommand {
+        name: "regras",
+        description: "Gerencia as regras do servidor.",
+        category: "Utilitários",
+        aliases: &[],
+        admin_only: true,
+    },
+    HelpCommand {
+        name: "afk",
+        description: "Define ou remove seu status de ausência.",
+        category: "Convivência",
+        aliases: &[],
+        admin_only: false,
+    },
+    HelpCommand {
+        name: "fun",
+        description: "Comandos sociais.",
+        category: "Convivência",
+        aliases: &[],
+        admin_only: false,
+    },
+    HelpCommand {
+        name: "poll",
+        description: "Cria uma enquete.",
+        category: "Convivência",
+        aliases: &[],
+        admin_only: false,
+    },
+    HelpCommand {
+        name: "remind",
+        description: "Cria um lembrete persistente.",
+        category: "Convivência",
+        aliases: &[],
+        admin_only: false,
+    },
+    HelpCommand {
+        name: "coinflip",
+        description: "Aposta em cara ou coroa.",
+        category: "Jogos",
+        aliases: &[],
+        admin_only: false,
+    },
+    HelpCommand {
+        name: "blackjack",
+        description: "Joga blackjack com moedas.",
+        category: "Jogos",
+        aliases: &[],
+        admin_only: false,
+    },
+    HelpCommand {
+        name: "balance",
+        description: "Consulta o saldo de um usuário.",
+        category: "Economia",
+        aliases: &["bal"],
+        admin_only: false,
+    },
+    HelpCommand {
+        name: "daily",
+        description: "Resgata sua recompensa diária.",
+        category: "Economia",
+        aliases: &[],
+        admin_only: false,
+    },
+    HelpCommand {
+        name: "work",
+        description: "Trabalha para ganhar moedas.",
+        category: "Economia",
+        aliases: &[],
+        admin_only: false,
+    },
+    HelpCommand {
+        name: "pay",
+        description: "Transfere moedas.",
+        category: "Economia",
+        aliases: &[],
+        admin_only: false,
+    },
+    HelpCommand {
+        name: "shop",
+        description: "Consulta ou compra itens.",
+        category: "Economia",
+        aliases: &[],
+        admin_only: false,
+    },
+    HelpCommand {
+        name: "inventory",
+        description: "Consulta o inventário de um usuário.",
+        category: "Economia",
+        aliases: &[],
+        admin_only: false,
+    },
+    HelpCommand {
+        name: "transactions",
+        description: "Consulta seu extrato de economia.",
+        category: "Economia",
+        aliases: &[],
+        admin_only: false,
+    },
+    HelpCommand {
+        name: "addsaldo",
+        description: "Adiciona saldo à carteira de um usuário.",
+        category: "Economia",
+        aliases: &[],
+        admin_only: true,
+    },
+    HelpCommand {
+        name: "level",
+        description: "Consulta seu nível e experiência.",
+        category: "Níveis",
+        aliases: &["rank"],
+        admin_only: false,
+    },
+    HelpCommand {
+        name: "leaderboard",
+        description: "Exibe o ranking de níveis.",
+        category: "Níveis",
+        aliases: &["rankings"],
+        admin_only: false,
+    },
+    HelpCommand {
+        name: "ranking",
+        description: "Exibe o ranking visual de níveis.",
+        category: "Níveis",
+        aliases: &["rank-card"],
+        admin_only: false,
+    },
+    HelpCommand {
+        name: "profile",
+        description: "Gera seu perfil visual com XP, nível e economia.",
+        category: "Níveis",
+        aliases: &["perfil"],
+        admin_only: false,
+    },
+    HelpCommand {
+        name: "profile-config",
+        description: "Configura o tema do seu perfil visual.",
+        category: "Níveis",
+        aliases: &[],
+        admin_only: false,
+    },
+    HelpCommand {
+        name: "level-config",
+        description: "Configura níveis.",
+        category: "Níveis",
+        aliases: &[],
+        admin_only: true,
+    },
+    HelpCommand {
+        name: "warn",
+        description: "Adverte um membro.",
+        category: "Moderação",
+        aliases: &[],
+        admin_only: true,
+    },
+    HelpCommand {
+        name: "warnings",
+        description: "Lista advertências.",
+        category: "Moderação",
+        aliases: &["warns"],
+        admin_only: true,
+    },
+    HelpCommand {
+        name: "timeout",
+        description: "Aplica timeout.",
+        category: "Moderação",
+        aliases: &[],
+        admin_only: true,
+    },
+    HelpCommand {
+        name: "untimeout",
+        description: "Remove timeout.",
+        category: "Moderação",
+        aliases: &[],
+        admin_only: true,
+    },
+    HelpCommand {
+        name: "kick",
+        description: "Expulsa um membro.",
+        category: "Moderação",
+        aliases: &[],
+        admin_only: true,
+    },
+    HelpCommand {
+        name: "ban",
+        description: "Bane um membro.",
+        category: "Moderação",
+        aliases: &[],
+        admin_only: true,
+    },
+    HelpCommand {
+        name: "unban",
+        description: "Remove o banimento de um usuário.",
+        category: "Moderação",
+        aliases: &[],
+        admin_only: true,
+    },
+    HelpCommand {
+        name: "clear",
+        description: "Apaga mensagens recentes do canal.",
+        category: "Moderação",
+        aliases: &["mod", "c"],
+        admin_only: true,
+    },
+    HelpCommand {
+        name: "lock",
+        description: "Bloqueia mensagens em um canal.",
+        category: "Moderação",
+        aliases: &[],
+        admin_only: true,
+    },
+    HelpCommand {
+        name: "unlock",
+        description: "Desbloqueia mensagens em um canal.",
+        category: "Moderação",
+        aliases: &[],
+        admin_only: true,
+    },
+    HelpCommand {
+        name: "automod",
+        description: "Configura a moderação automática.",
+        category: "Moderação",
+        aliases: &[],
+        admin_only: true,
+    },
+    HelpCommand {
+        name: "welcome",
+        description: "Configura boas-vindas, saídas e painéis de cores.",
+        category: "Boas-vindas",
+        aliases: &[],
+        admin_only: true,
+    },
+];
+
+fn visible_help_commands(
+    can_see_admin_commands: bool,
+) -> impl Iterator<Item = &'static HelpCommand> {
+    HELP_COMMANDS
+        .iter()
+        .filter(move |command| can_see_admin_commands || !command.admin_only)
+}
+
+fn help_categories(can_see_admin_commands: bool) -> Vec<(&'static str, Vec<&'static HelpCommand>)> {
+    let mut grouped: HashMap<&'static str, Vec<&'static HelpCommand>> = HashMap::new();
+    for command in visible_help_commands(can_see_admin_commands) {
+        grouped.entry(command.category).or_default().push(command);
+    }
+
+    let mut categories = grouped.into_iter().collect::<Vec<_>>();
+    categories.sort_by(|left, right| left.0.cmp(right.0));
+    categories
+}
+
+fn find_help_command(query: &str) -> Option<&'static HelpCommand> {
+    let query = query.to_lowercase();
+    HELP_COMMANDS.iter().find(|command| {
+        command.name.eq_ignore_ascii_case(&query)
+            || command
+                .aliases
+                .iter()
+                .any(|alias| alias.eq_ignore_ascii_case(&query))
+    })
+}
+
+fn help_menu(
+    owner_id: UserId,
+    can_see_admin_commands: bool,
+    selected_category: Option<&str>,
+) -> Value {
+    let options = help_categories(can_see_admin_commands)
+        .into_iter()
+        .take(25)
+        .map(|(category, commands)| {
+            json!({
+                "label": category,
+                "value": category,
+                "description": format!("{} comando(s)", commands.len()),
+                "default": selected_category == Some(category),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "type": 1,
+        "components": [{
+            "type": 3,
+            "custom_id": format!("help:category:{owner_id}"),
+            "placeholder": "Selecione uma categoria",
+            "options": options,
+        }],
+    })
+}
+
+fn help_container(
+    content: String,
+    owner_id: UserId,
+    can_see_admin_commands: bool,
+    selected_category: Option<&str>,
+) -> Value {
+    // Serenity 0.12.5 ainda não possui builders para Components V2. Estes são
+    // os mesmos componentes enviados pelo discord.js: Container + TextDisplay
+    // + ActionRow/StringSelectMenu.
+    json!({
+        "type": 17,
+        "accent_color": PURPLE,
+        "components": [
+            { "type": 10, "content": content },
+            help_menu(owner_id, can_see_admin_commands, selected_category),
+        ],
+    })
+}
+
+fn help_home_panel(owner_id: UserId, can_see_admin_commands: bool, state: &State) -> Value {
+    let mut description = vec![
+        "# Central de ajuda".to_string(),
+        String::new(),
+        "Use o menu abaixo para navegar pelos comandos.".to_string(),
+        String::new(),
+    ];
+    description.extend(
+        help_categories(can_see_admin_commands)
+            .into_iter()
+            .map(|(category, commands)| format!("**{category}** — {} comando(s)", commands.len())),
+    );
+
+    if state.config.prefix_commands {
+        description.push(String::new());
+        description.push(format!("Prefixo legado ativo: `{}`", state.config.prefix));
+    }
+
+    help_container(
+        description.join("\n"),
+        owner_id,
+        can_see_admin_commands,
+        None,
+    )
+}
+
+fn help_category_panel(owner_id: UserId, can_see_admin_commands: bool, category: &str) -> Value {
+    let categories = help_categories(can_see_admin_commands);
+    let Some((_, commands)) = categories.iter().find(|(name, _)| *name == category) else {
+        return help_container(
+            "# Categoria não encontrada\n\nSelecione uma categoria válida no menu abaixo.".into(),
+            owner_id,
+            can_see_admin_commands,
+            None,
+        );
+    };
+
+    let mut content = vec![format!("# Ajuda • {category}"), String::new()];
+    content.extend(
+        commands
+            .iter()
+            .map(|command| format!("`/{}` — {}", command.name, command.description)),
+    );
+    content.extend([
+        String::new(),
+        "-# Use `/help comando` para detalhes de um comando.".to_string(),
+    ]);
+
+    help_container(
+        content.join("\n"),
+        owner_id,
+        can_see_admin_commands,
+        Some(category),
+    )
+}
+
+fn command_help_panel(query: &str, owner_id: UserId, can_see_admin_commands: bool) -> Value {
+    let command =
+        find_help_command(query).filter(|command| can_see_admin_commands || !command.admin_only);
+    let Some(command) = command else {
+        return help_container(
+            format!(
+                "# Comando não encontrado\n\nNenhum comando disponível foi encontrado para `{query}`.\nUse `/help` para abrir o painel por categoria."
+            ),
+            owner_id,
+            can_see_admin_commands,
+            None,
+        );
+    };
+
+    let aliases = if command.aliases.is_empty() {
+        "*Nenhum*".to_string()
+    } else {
+        command
+            .aliases
+            .iter()
+            .map(|alias| format!("`{alias}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let content = [
+        format!("# Detalhes do comando: `/{}`", command.name),
+        String::new(),
+        format!("**Descrição:** {}", command.description),
+        format!("**Categoria:** {}", command.category),
+        format!("**Como usar:** `/{}`", command.name),
+        format!("**Aliases legados:** {aliases}"),
+    ]
+    .join("\n");
+
+    help_container(
+        content,
+        owner_id,
+        can_see_admin_commands,
+        Some(command.category),
+    )
+}
+
+async fn send_components_v2_interaction(
+    http: &Http,
+    interaction_id: InteractionId,
+    token: &str,
+    response_type: u8,
+    panel: Value,
+) -> BotResult<()> {
+    let payload = json!({
+        "type": response_type,
+        "data": {
+            "flags": COMPONENTS_V2_FLAG,
+            "components": [panel],
+        },
+    });
+    let body = serde_json::to_vec(&payload)?;
+    http.request(
+        Request::new(
+            Route::InteractionResponse {
+                interaction_id,
+                token,
+            },
+            LightMethod::Post,
+        )
+        .body(Some(body)),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn send_components_v2_channel(
+    http: &Http,
+    channel_id: ChannelId,
+    panel: Value,
+    reply_to: Option<MessageId>,
+) -> BotResult<()> {
+    let mut payload = json!({
+        "flags": COMPONENTS_V2_FLAG,
+        "components": [panel],
+    });
+    if let Some(message_id) = reply_to {
+        payload["message_reference"] = json!({ "message_id": message_id.get() });
+    }
+
+    let body = serde_json::to_vec(&payload)?;
+    http.request(
+        Request::new(Route::ChannelMessages { channel_id }, LightMethod::Post).body(Some(body)),
+    )
+    .await?;
+    Ok(())
+}
+
+struct PanelTechnology {
+    key: &'static str,
+    name: &'static str,
+}
+
+const PANEL_TECHNOLOGIES: &[PanelTechnology] = &[
+    PanelTechnology {
+        key: "javascript",
+        name: "JavaScript",
+    },
+    PanelTechnology {
+        key: "typescript",
+        name: "TypeScript",
+    },
+    PanelTechnology {
+        key: "python",
+        name: "Python",
+    },
+    PanelTechnology {
+        key: "java",
+        name: "Java",
+    },
+    PanelTechnology {
+        key: "c-sharp",
+        name: "C#",
+    },
+    PanelTechnology {
+        key: "c-plus-plus",
+        name: "C++",
+    },
+    PanelTechnology {
+        key: "c",
+        name: "C",
+    },
+    PanelTechnology {
+        key: "go",
+        name: "Go",
+    },
+    PanelTechnology {
+        key: "rust",
+        name: "Rust",
+    },
+    PanelTechnology {
+        key: "php",
+        name: "PHP",
+    },
+    PanelTechnology {
+        key: "ruby",
+        name: "Ruby",
+    },
+    PanelTechnology {
+        key: "kotlin",
+        name: "Kotlin",
+    },
+    PanelTechnology {
+        key: "swift",
+        name: "Swift",
+    },
+    PanelTechnology {
+        key: "html",
+        name: "HTML",
+    },
+    PanelTechnology {
+        key: "css",
+        name: "CSS",
+    },
+    PanelTechnology {
+        key: "react",
+        name: "React",
+    },
+    PanelTechnology {
+        key: "next-js",
+        name: "Next.js",
+    },
+    PanelTechnology {
+        key: "node-js",
+        name: "Node.js",
+    },
+    PanelTechnology {
+        key: "discord-js",
+        name: "discord.js",
+    },
+    PanelTechnology {
+        key: "vue",
+        name: "Vue",
+    },
+    PanelTechnology {
+        key: "angular",
+        name: "Angular",
+    },
+    PanelTechnology {
+        key: "svelte",
+        name: "Svelte",
+    },
+    PanelTechnology {
+        key: "sql",
+        name: "SQL",
+    },
+    PanelTechnology {
+        key: "mongodb",
+        name: "MongoDB",
+    },
+    PanelTechnology {
+        key: "docker",
+        name: "Docker",
+    },
+];
+
+// IDs sincronizados com cargos.md.
+const TECHNOLOGY_ROLE_IDS: &[(&str, u64)] = &[
+    ("javascript", 1_548_761_291_789_828_216),
+    ("typescript", 1_548_767_613_000_351_834),
+    ("python", 1_548_767_726_552_490_055),
+    ("java", 1_548_767_767_732_424_806),
+    ("c-sharp", 1_548_767_808_605_782_087),
+    ("c-plus-plus", 1_548_767_852_855_693_352),
+    ("go", 1_548_767_913_572_565_123),
+    ("rust", 1_548_767_946_725_483_303),
+    ("php", 1_548_767_983_172_853_862),
+    ("kotlin", 1_548_768_052_978_520_185),
+    ("swift", 1_548_768_090_597_228_698),
+    ("html", 1_548_768_135_182_553_138),
+    ("css", 1_548_768_178_130_205_160),
+    ("react", 1_548_768_218_246_549_515),
+    ("next-js", 1_548_768_260_361_818_223),
+    ("node-js", 1_548_768_309_795_627_078),
+    ("vue", 1_548_768_387_486_978_273),
+    ("discord-js", 1_548_768_351_051_063_346),
+    ("angular", 1_548_768_425_482_911_814),
+    ("svelte", 1_548_768_462_275_350_610),
+    ("sql", 1_548_768_499_449_471_196),
+    ("docker", 1_548_768_531_095_485_665),
+    ("mongodb", 1_548_768_571_922_976_848),
+    ("c", 1_548_767_881_624_424_590),
+];
+
+fn technology_role_id(key: &str) -> Option<RoleId> {
+    TECHNOLOGY_ROLE_IDS
+        .iter()
+        .find(|(technology, _)| *technology == key)
+        .map(|(_, role_id)| RoleId::new(*role_id))
+}
+
+fn panel_container(content: &str, children: Vec<Value>) -> Value {
+    let mut components = vec![json!({ "type": 10, "content": content })];
+    components.extend(children);
+    json!({
+        "type": 17,
+        "accent_color": PURPLE,
+        "components": components,
+    })
+}
+
+fn verify_panel(role_id: RoleId) -> Value {
+    panel_container(
+        "# Verificação\n\nClique no botão abaixo para receber o cargo **Membro** e liberar o acesso ao servidor.",
+        vec![json!({
+            "type": 1,
+            "components": [{
+                "type": 2,
+                "custom_id": format!("panel:verify:{role_id}"),
+                "label": "Receber cargo Membro",
+                "style": 3,
+            }],
+        })],
+    )
+}
+
+fn colors_panel(roles: Vec<&Role>) -> Value {
+    let options = roles
+        .into_iter()
+        .map(|role| json!({ "label": role.name, "value": role.id.to_string() }))
+        .collect::<Vec<_>>();
+    panel_container(
+        "# Cores\n\nEscolha uma cor para receber o cargo correspondente. Selecionar outra cor remove a anterior.",
+        vec![json!({
+            "type": 1,
+            "components": [{
+                "type": 3,
+                "custom_id": "panel:colors",
+                "placeholder": "Escolha uma cor",
+                "min_values": 0,
+                "max_values": 1,
+                "options": options,
+            }],
+        })],
+    )
+}
+
+fn technology_emoji_names(key: &str) -> &'static [&'static str] {
+    match key {
+        "javascript" => &["javascript"],
+        "typescript" => &["typescript", "ts"],
+        "python" => &["python"],
+        "java" => &["java"],
+        "c-sharp" => &["csharp", "c-sharp"],
+        "c-plus-plus" => &["cpp", "c-plus-plus", "clang"],
+        "c" => &["clang", "c"],
+        "go" => &["golang", "go"],
+        "rust" => &["rust"],
+        "php" => &["php"],
+        "ruby" => &["ruby"],
+        "kotlin" => &["kotlin"],
+        "swift" => &["swift"],
+        "html" => &["html"],
+        "css" => &["css"],
+        "react" => &["react"],
+        "next-js" => &["nextjs", "next-js"],
+        "node-js" => &["nodejs", "node-js"],
+        "discord-js" => &["djs", "discordjs", "discord-js"],
+        "vue" => &["vuejs", "vue"],
+        "angular" => &["angular"],
+        "svelte" => &["svelte"],
+        "sql" => &["sql"],
+        "mongodb" => &["mongodb"],
+        "docker" => &["docker"],
+        _ => &[],
+    }
+}
+
+fn technology_emoji<'a>(key: &str, emojis: &'a [Emoji]) -> Option<&'a Emoji> {
+    technology_emoji_names(key).iter().find_map(|name| {
+        emojis
+            .iter()
+            .find(|emoji| emoji.available && emoji.name.eq_ignore_ascii_case(name))
+    })
+}
+
+fn technology_panel(emojis: &[Emoji]) -> Value {
+    let options = PANEL_TECHNOLOGIES
+        .iter()
+        .filter_map(|technology| {
+            let role_id = technology_role_id(technology.key)?;
+            let mut option = json!({
+                "label": technology.name,
+                "value": role_id.to_string(),
+            });
+            if let Some(emoji) = technology_emoji(technology.key, emojis) {
+                option["emoji"] = json!({
+                    "id": emoji.id.to_string(),
+                    "name": emoji.name,
+                    "animated": emoji.animated,
+                });
+            }
+            Some(option)
+        })
+        .collect::<Vec<_>>();
+    panel_container(
+        "# Tecnologias\n\nSelecione uma ou mais tecnologias para receber os cargos correspondentes.",
+        vec![json!({
+            "type": 1,
+            "components": [{
+                "type": 3,
+                "custom_id": "panel:tech",
+                "placeholder": "Escolha suas tecnologias",
+                "min_values": 0,
+                "max_values": options.len(),
+                "options": options,
+            }],
+        })],
+    )
+}
+
+fn panel_technology(key: &str) -> Option<&'static PanelTechnology> {
+    PANEL_TECHNOLOGIES.iter().find(|technology| {
+        technology.key.eq_ignore_ascii_case(key) || technology.name.eq_ignore_ascii_case(key)
+    })
+}
+
 fn find_option<'a>(
     options: &'a [CommandDataOption],
     name: &str,
@@ -1246,7 +2624,7 @@ async fn handle_command(
     }
     let name = command.data.name.as_str();
     match name {
-        "help" => command_help(ctx, command).await?,
+        "help" => command_help_components_v2(ctx, state, command).await?,
         "ping" => reply(command, &ctx.http, "Pong! 🏓", false).await?,
         "avatar" => command_avatar(ctx, command).await?,
         "userinfo" => command_userinfo(ctx, command).await?,
@@ -1254,7 +2632,8 @@ async fn handle_command(
         "calc" => command_calc(&ctx.http, command).await?,
         "devex" => command_devex(state, &ctx.http, command).await?,
         "resume" => command_resume(state, &ctx.http, command).await?,
-        "verify" | "captcha" => command_verify(ctx, command).await?,
+        "verify" => command_verify(ctx, command).await?,
+        "captcha" => command_captcha(ctx, command).await?,
         "tech" => command_tech(ctx, command).await?,
         "cores" => command_cores(ctx, command).await?,
         "ticket" => command_ticket(ctx, command).await?,
@@ -1275,6 +2654,7 @@ async fn handle_command(
         "level" | "leaderboard" | "ranking" | "profile" => {
             command_levels(state, &ctx.http, command, name).await?
         }
+        "profile-config" => command_profile_config(state, &ctx.http, command).await?,
         "level-config" => command_level_config(state, &ctx.http, command).await?,
         "warn" | "warnings" | "timeout" | "untimeout" | "kick" | "ban" | "unban" | "clear"
         | "lock" | "unlock" => command_moderation(ctx, state, command, name).await?,
@@ -1293,84 +2673,21 @@ async fn handle_command(
     Ok(())
 }
 
-async fn command_help(ctx: &Context, command: &CommandInteraction) -> BotResult<()> {
-    let requested = option_string(command, "comando");
-    if let Some(name) = requested {
-        let known = [
-            "help",
-            "ping",
-            "avatar",
-            "userinfo",
-            "serverinfo",
-            "calc",
-            "devex",
-            "resume",
-            "verify",
-            "captcha",
-            "tech",
-            "cores",
-            "ticket",
-            "reels",
-            "tkk",
-            "feed",
-            "novidades",
-            "regras",
-            "afk",
-            "fun",
-            "poll",
-            "remind",
-            "coinflip",
-            "blackjack",
-            "balance",
-            "daily",
-            "work",
-            "pay",
-            "shop",
-            "inventory",
-            "transactions",
-            "addsaldo",
-            "level",
-            "leaderboard",
-            "ranking",
-            "profile",
-            "level-config",
-            "warn",
-            "warnings",
-            "timeout",
-            "untimeout",
-            "kick",
-            "ban",
-            "unban",
-            "clear",
-            "lock",
-            "unlock",
-            "automod",
-            "welcome",
-        ]
-        .contains(&name.as_str());
-        return reply(
-            command,
-            &ctx.http,
-            if known {
-                format!("`/{name}` está disponível. Use as opções exibidas pelo Discord.")
-            } else {
-                "Comando não encontrado.".into()
-            },
-            true,
-        )
-        .await;
-    }
-    let text = "**Informação**\n`help` `ping` `avatar` `userinfo` `serverinfo`\n\n**Utilidades**\n`calc` `devex` `resume` `verify` `captcha` `tech` `cores` `ticket` `reels` `tkk` `feed` `novidades` `regras`\n\n**Convivência e jogos**\n`afk` `fun` `poll` `remind` `coinflip` `blackjack`\n\n**Economia e níveis**\n`balance` `daily` `work` `pay` `shop` `inventory` `transactions` `level` `leaderboard` `ranking` `profile`\n\n**Administração**\n`addsaldo` `level-config` `warn` `warnings` `timeout` `untimeout` `kick` `ban` `unban` `clear` `lock` `unlock` `automod` `welcome`";
-    embed_reply(
-        command,
-        &ctx.http,
-        CreateEmbed::new()
-            .title("LarperBot — ajuda")
-            .description(text)
-            .color(PURPLE),
-        false,
-    )
-    .await
+async fn command_help_components_v2(
+    ctx: &Context,
+    state: &Arc<State>,
+    command: &CommandInteraction,
+) -> BotResult<()> {
+    let query = option_string(command, "comando")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let can_see_admin_commands = is_admin(command);
+    let panel = query
+        .as_deref()
+        .map(|value| command_help_panel(value, command.user.id, can_see_admin_commands))
+        .unwrap_or_else(|| help_home_panel(command.user.id, can_see_admin_commands, state));
+
+    send_components_v2_interaction(&ctx.http, command.id, &command.token, 4, panel).await
 }
 
 async fn command_avatar(ctx: &Context, command: &CommandInteraction) -> BotResult<()> {
@@ -1546,131 +2863,90 @@ async fn command_resume(
 }
 
 async fn command_verify(ctx: &Context, command: &CommandInteraction) -> BotResult<()> {
-    let channel = option_channel_or_current(command, "canal");
-    channel
-        .send_message(
+    let guild_id = command_guild(command)?;
+    let roles = guild_id.roles(&ctx.http).await?;
+    let Some(member_role) = roles.get(&RoleId::new(VERIFIED_ROLE_ID)) else {
+        return reply(
+            command,
             &ctx.http,
-            CreateMessage::new()
-                .embed(
-                    CreateEmbed::new()
-                        .title("Verificação")
-                        .description("Clique para receber o cargo de membro.")
-                        .color(PURPLE),
-                )
-                .components(vec![CreateActionRow::Buttons(vec![CreateButton::new(
-                    "verify:member",
-                )
-                .label("Verificar")
-                .style(ButtonStyle::Success)])]),
+            format!(
+                "O cargo de verificado (`{VERIFIED_ROLE_ID}`) não foi encontrado neste servidor."
+            ),
+            true,
         )
-        .await?;
+        .await;
+    };
+    let channel = option_channel_or_current(command, "canal");
+    send_components_v2_channel(&ctx.http, channel, verify_panel(member_role.id), None).await?;
     reply(command, &ctx.http, "Painel publicado.", true).await
 }
 
-async fn command_tech(ctx: &Context, command: &CommandInteraction) -> BotResult<()> {
-    let channel = option_channel_or_current(command, "canal");
-    let names = [
-        "Rust",
-        "TypeScript",
-        "JavaScript",
-        "Python",
-        "C#",
-        "C++",
-        "Java",
-        "Go",
-        "Kotlin",
-        "Swift",
-        "Dart",
-        "PHP",
-        "Ruby",
-        "Lua",
-        "SQL",
-        "HTML",
-        "CSS",
-        "React",
-        "Vue",
-        "Svelte",
-        "Node.js",
-        "Docker",
-        "Git",
-        "Linux",
-        "Godot",
-    ];
-    let rows = names
-        .chunks(5)
-        .map(|chunk| {
-            CreateActionRow::Buttons(
-                chunk
-                    .iter()
-                    .map(|name| {
-                        CreateButton::new(format!("tech:{name}"))
-                            .label(*name)
-                            .style(ButtonStyle::Secondary)
-                    })
-                    .collect(),
-            )
-        })
-        .collect();
+async fn command_captcha(ctx: &Context, command: &CommandInteraction) -> BotResult<()> {
+    command_guild(command)?;
+    let channel = ChannelId::new(CAPTCHA_CHANNEL_ID);
+
     channel
         .send_message(
             &ctx.http,
-            CreateMessage::new()
-                .embed(
-                    CreateEmbed::new()
-                        .title("Tecnologias")
-                        .description("Escolha uma tecnologia para ver uma descrição.")
-                        .color(PURPLE),
-                )
-                .components(rows),
+            CreateMessage::new().embed(CreateEmbed::new().description(CAPTCHA_WARNING)),
         )
         .await?;
+    reply(
+        command,
+        &ctx.http,
+        "Aviso do canal #captcha publicado.",
+        true,
+    )
+    .await
+}
+
+async fn command_tech(ctx: &Context, command: &CommandInteraction) -> BotResult<()> {
+    let guild_id = command_guild(command)?;
+    let emojis = guild_id.emojis(&ctx.http).await?;
+    let channel = option_channel_or_current(command, "canal");
+    send_components_v2_channel(&ctx.http, channel, technology_panel(&emojis), None).await?;
     reply(command, &ctx.http, "Painel publicado.", true).await
 }
 
 async fn command_cores(ctx: &Context, command: &CommandInteraction) -> BotResult<()> {
-    let channel = option_channel_or_current(command, "canal");
-    let names = [
-        "Vermelho",
-        "Branco",
-        "Preto",
-        "Vermelho Vinho",
-        "Rosa",
-        "Amarelo",
-        "Verde",
-        "Verde Escuro",
-        "Azul",
-        "Roxo",
-        "Laranja",
-        "Marrom",
-    ];
-    let rows = names
-        .chunks(5)
-        .map(|chunk| {
-            CreateActionRow::Buttons(
-                chunk
-                    .iter()
-                    .map(|name| {
-                        CreateButton::new(format!("color:{name}"))
-                            .label(*name)
-                            .style(ButtonStyle::Secondary)
-                    })
-                    .collect(),
-            )
+    let guild_id = command_guild(command)?;
+    let roles = guild_id.roles(&ctx.http).await?;
+    let missing = COLOR_ROLE_NAMES
+        .iter()
+        .filter(|name| {
+            !roles
+                .values()
+                .any(|role| role.name.eq_ignore_ascii_case(name))
         })
-        .collect();
-    channel
-        .send_message(
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return reply(
+            command,
             &ctx.http,
-            CreateMessage::new()
-                .embed(
-                    CreateEmbed::new()
-                        .title("Cores")
-                        .description("Escolha uma cor para receber o cargo correspondente.")
-                        .color(PURPLE),
-                )
-                .components(rows),
+            format!(
+                "Crie estes cargos antes de publicar o painel: {}.",
+                missing
+                    .iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            true,
         )
-        .await?;
+        .await;
+    }
+
+    let color_roles = COLOR_ROLE_NAMES
+        .iter()
+        .filter_map(|name| {
+            roles
+                .values()
+                .find(|role| role.name.eq_ignore_ascii_case(name))
+        })
+        .collect::<Vec<_>>();
+    let channel = option_channel_or_current(command, "canal");
+    send_components_v2_channel(&ctx.http, channel, colors_panel(color_roles), None).await?;
     reply(command, &ctx.http, "Painel publicado.", true).await
 }
 
@@ -2688,6 +3964,98 @@ async fn command_add_balance(
     .await
 }
 
+async fn profile_image(
+    state: &Arc<State>,
+    guild: &str,
+    user: &User,
+    profile: &Profile,
+) -> BotResult<Vec<u8>> {
+    let rank = {
+        let db = state.db();
+        db.conn.query_row(
+            "SELECT COUNT(*) FROM profiles WHERE guild_id=?1 AND total_xp>?2",
+            params![guild, profile.total_xp],
+            |row| row.get::<_, i64>(0),
+        )? + 1
+    };
+    Ok(render_profile_card(
+        &state.http,
+        ProfileCardInput {
+            username: user.name.clone(),
+            avatar_url: user.face(),
+            level: level_from_xp(profile.total_xp),
+            total_xp: profile.total_xp,
+            rank,
+            background: profile.profile_background.clone(),
+        },
+    )
+    .await?)
+}
+
+async fn ranking_image(
+    state: &Arc<State>,
+    http: &Http,
+    guild: &str,
+    period: &str,
+    background: &str,
+) -> BotResult<Vec<u8>> {
+    let (field, period_label) = match period {
+        "weekly" => ("weekly_xp", "Semanal"),
+        "monthly" => ("monthly_xp", "Mensal"),
+        _ => ("total_xp", "Total"),
+    };
+    let rows = {
+        let db = state.db();
+        let mut statement = db.conn.prepare(&format!(
+            "SELECT username,user_id,{field} FROM profiles WHERE guild_id=?1 ORDER BY {field} DESC LIMIT 10"
+        ))?;
+        let mut result = Vec::new();
+        let mut query = statement.query(params![guild])?;
+        while let Some(row) = query.next()? {
+            result.push((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ));
+        }
+        result
+    };
+
+    let entries =
+        futures::future::join_all(rows.into_iter().map(|(username, user_id, xp)| async move {
+            let fallback_avatar = user_id
+                .parse::<u64>()
+                .map(|id| format!("https://cdn.discordapp.com/embed/avatars/{}.png", id % 5))
+                .unwrap_or_default();
+            if let Ok(id) = user_id.parse::<u64>() {
+                if let Ok(user) = http.get_user(UserId::new(id)).await {
+                    let avatar_url = user.face();
+                    return RankingEntry {
+                        username: user.name,
+                        avatar_url,
+                        xp,
+                    };
+                }
+            }
+            RankingEntry {
+                username,
+                avatar_url: fallback_avatar,
+                xp,
+            }
+        }))
+        .await;
+
+    Ok(render_ranking_card(
+        &state.http,
+        RankingCardInput {
+            period: period_label.to_string(),
+            entries,
+            background: background.to_string(),
+        },
+    )
+    .await?)
+}
+
 async fn command_levels(
     state: &Arc<State>,
     http: &Http,
@@ -2695,14 +4063,16 @@ async fn command_levels(
     name: &str,
 ) -> BotResult<()> {
     let guild = command_guild(command)?.to_string();
+    if matches!(name, "profile" | "ranking" | "leaderboard") {
+        command.defer(http).await?;
+    }
     let target = option_user(command, "usuario").unwrap_or(command.user.id);
-    let username = if target == command.user.id {
-        command.user.name.clone()
+    let user = if target == command.user.id {
+        command.user.clone()
     } else {
-        ctx_user_name(http, target)
-            .await
-            .unwrap_or_else(|| target.to_string())
+        http.get_user(target).await?
     };
+    let username = user.name.clone();
     let profile = state.db().profile(&guild, &target.to_string(), &username)?;
     match name {
         "level" => {
@@ -2711,100 +4081,57 @@ async fn command_levels(
             embed_reply(command, http, CreateEmbed::new().title(format!("Nível de {username}")).description(format!("Nível **{level}**\nXP total: **{}** / **{next}**\nXP semanal: **{}**\nXP mensal: **{}**", profile.total_xp, profile.weekly_xp, profile.monthly_xp)).color(PURPLE), false).await
         }
         "profile" => {
-            let background = profile.profile_background.clone();
+            let image = profile_image(state, &guild, &user, &profile).await?;
+            let attachment = CreateAttachment::bytes(image, "profile.png");
             command
-                .create_response(
+                .edit_response(
                     http,
-                    CreateInteractionResponse::Message(
-                        CreateInteractionResponseMessage::new()
-                            .embed(
-                                CreateEmbed::new()
-                                    .title(format!("Perfil de {username}"))
-                                    .description(format!(
-                                        "Nível **{}**\nXP total: **{}**\nFundo: `{background}`",
-                                        level_from_xp(profile.total_xp),
-                                        profile.total_xp
-                                    ))
-                                    .color(PURPLE),
-                            )
-                            .components(vec![CreateActionRow::Buttons(vec![
-                                CreateButton::new("profile:bg:midnight")
-                                    .label("Midnight")
-                                    .style(ButtonStyle::Secondary),
-                                CreateButton::new("profile:bg:aurora")
-                                    .label("Aurora")
-                                    .style(ButtonStyle::Secondary),
-                                CreateButton::new("profile:bg:sunset")
-                                    .label("Sunset")
-                                    .style(ButtonStyle::Secondary),
-                                CreateButton::new("profile:bg:cyber")
-                                    .label("Cyber Grid")
-                                    .style(ButtonStyle::Secondary),
-                            ])]),
-                    ),
+                    EditInteractionResponse::new().new_attachment(attachment),
                 )
                 .await?;
             Ok(())
         }
-        "ranking" => {
-            let description = format!(
-                "XP total de **{username}**: **{}**\nNível: **{}**",
-                profile.total_xp,
-                level_from_xp(profile.total_xp)
-            );
-            embed_reply(
-                command,
-                http,
-                CreateEmbed::new()
-                    .title("Ranking visual")
-                    .description(description)
-                    .color(PURPLE),
-                false,
-            )
-            .await
-        }
-        "leaderboard" => {
+        "ranking" | "leaderboard" => {
             let period = option_string(command, "periodo").unwrap_or_else(|| "total".into());
-            let field = match period.as_str() {
-                "weekly" => "weekly_xp",
-                "monthly" => "monthly_xp",
-                _ => "total_xp",
-            };
-            let lines = {
-                let conn = state.db();
-                let mut stmt = conn.conn.prepare(&format!("SELECT username,user_id,{field} FROM profiles WHERE guild_id=?1 ORDER BY {field} DESC LIMIT 10"))?;
-                let mut rows = stmt.query(params![guild])?;
-                let mut lines = Vec::new();
-                let mut position = 1;
-                while let Some(row) = rows.next()? {
-                    let user: String = row.get(0)?;
-                    let id: String = row.get(1)?;
-                    let xp: i64 = row.get(2)?;
-                    lines.push(format!(
-                        "**{}.** {} (<@{}>) — {} XP",
-                        position, user, id, xp
-                    ));
-                    position += 1;
-                }
-                lines
-            };
-            embed_reply(
-                command,
-                http,
-                CreateEmbed::new()
-                    .title("Ranking")
-                    .description(if lines.is_empty() {
-                        "Ainda não há dados.".into()
-                    } else {
-                        lines.join("\n")
-                    })
-                    .color(PURPLE),
-                false,
-            )
-            .await
+            let image =
+                ranking_image(state, http, &guild, &period, &profile.profile_background).await?;
+            let attachment = CreateAttachment::bytes(image, "ranking.png");
+            command
+                .edit_response(
+                    http,
+                    EditInteractionResponse::new().new_attachment(attachment),
+                )
+                .await?;
+            Ok(())
         }
         _ => reply(command, http, "Comando de níveis inválido.", true).await,
     }
+}
+
+async fn command_profile_config(
+    state: &Arc<State>,
+    http: &Http,
+    command: &CommandInteraction,
+) -> BotResult<()> {
+    let guild = command_guild(command)?.to_string();
+    let theme = option_string(command, "tema").unwrap_or_else(|| "midnight".into());
+    if !is_profile_theme(&theme) {
+        return reply(command, http, "Esse tema não está disponível.", true).await;
+    }
+
+    let mut profile =
+        state
+            .db()
+            .profile(&guild, &command.user.id.to_string(), &command.user.name)?;
+    profile.profile_background = theme.clone();
+    state.db().save_profile(&profile)?;
+    reply(
+        command,
+        http,
+        format!("Tema do perfil alterado para **{theme}**. Use `/profile` para visualizar."),
+        true,
+    )
+    .await
 }
 
 async fn command_level_config(
@@ -2889,6 +4216,19 @@ async fn command_moderation(
                 &reason,
             )?;
             let _ = target.create_dm_channel(&ctx.http).await;
+            let target_label = audit_user_label(&ctx.http, target).await;
+            send_punishment_log(
+                ctx,
+                guild,
+                "Advertencia",
+                &target_label,
+                &audit_actor_label(&command.user),
+                &reason,
+                Some(command.channel_id),
+                &format!("Caso #{case}. Advertencia registrada no banco local."),
+                0xF1C40F,
+            )
+            .await;
             return reply(
                 command,
                 &ctx.http,
@@ -2902,6 +4242,19 @@ async fn command_moderation(
             let reason =
                 option_string(command, "motivo").unwrap_or_else(|| "Sem motivo informado".into());
             guild.kick_with_reason(&ctx.http, target, &reason).await?;
+            let target_label = audit_user_label(&ctx.http, target).await;
+            send_punishment_log(
+                ctx,
+                guild,
+                "Expulsao",
+                &target_label,
+                &audit_actor_label(&command.user),
+                &reason,
+                Some(command.channel_id),
+                "Comando manual /kick.",
+                RED,
+            )
+            .await;
             return reply(command, &ctx.http, "Membro expulso.", false).await;
         }
         "ban" => {
@@ -2909,13 +4262,40 @@ async fn command_moderation(
             let reason =
                 option_string(command, "motivo").unwrap_or_else(|| "Sem motivo informado".into());
             guild.ban_with_reason(&ctx.http, target, 0, &reason).await?;
+            let target_label = audit_user_label(&ctx.http, target).await;
+            send_punishment_log(
+                ctx,
+                guild,
+                "Banimento",
+                &target_label,
+                &audit_actor_label(&command.user),
+                &reason,
+                Some(command.channel_id),
+                "Comando manual /ban. Nenhuma mensagem adicional foi removida.",
+                RED,
+            )
+            .await;
             return reply(command, &ctx.http, "Membro banido.", false).await;
         }
         "unban" => {
             let target = option_string(command, "usuario_id")
                 .ok_or("ID obrigatório")?
                 .parse::<u64>()?;
-            guild.unban(&ctx.http, UserId::new(target)).await?;
+            let target = UserId::new(target);
+            guild.unban(&ctx.http, target).await?;
+            let target_label = audit_user_label(&ctx.http, target).await;
+            send_punishment_log(
+                ctx,
+                guild,
+                "Banimento removido",
+                &target_label,
+                &audit_actor_label(&command.user),
+                "Remocao manual do banimento.",
+                Some(command.channel_id),
+                "Comando manual /unban.",
+                BLUE,
+            )
+            .await;
             return reply(command, &ctx.http, "Banimento removido.", false).await;
         }
         "timeout" | "untimeout" => {
@@ -2925,15 +4305,44 @@ async fn command_moderation(
                 member
                     .edit(&ctx.http, EditMember::new().enable_communication())
                     .await?;
+                let target_label = audit_user_label(&ctx.http, target).await;
+                send_punishment_log(
+                    ctx,
+                    guild,
+                    "Timeout removido",
+                    &target_label,
+                    &audit_actor_label(&command.user),
+                    "Remocao manual do timeout.",
+                    Some(command.channel_id),
+                    "Comando manual /untimeout.",
+                    BLUE,
+                )
+                .await;
                 return reply(command, &ctx.http, "Timeout removido.", false).await;
             }
             let duration = parse_duration(&option_string(command, "duracao").unwrap_or_default())
                 .ok_or("Duração inválida (máximo 28 dias).")?;
-            let until = Timestamp::from_unix_timestamp(now() + duration)
-                .map_err(|_| "timestamp inválido")?;
+            let until_unix = now() + duration;
+            let until =
+                Timestamp::from_unix_timestamp(until_unix).map_err(|_| "timestamp inválido")?;
             member
                 .disable_communication_until_datetime(&ctx.http, until)
                 .await?;
+            let target_label = audit_user_label(&ctx.http, target).await;
+            send_punishment_log(
+                ctx,
+                guild,
+                "Timeout",
+                &target_label,
+                &audit_actor_label(&command.user),
+                "Timeout aplicado manualmente.",
+                Some(command.channel_id),
+                &format!(
+                    "Comando manual /timeout. Duracao: {duration} segundos. Expira: <t:{until_unix}:F>."
+                ),
+                BLUE,
+            )
+            .await;
             return reply(command, &ctx.http, "Timeout aplicado.", false).await;
         }
         "clear" => {
@@ -2951,13 +4360,28 @@ async fn command_moderation(
             if !ids.is_empty() {
                 command.channel_id.delete_messages(&ctx.http, ids).await?;
             }
+            let deleted = quantity.min(messages.len() as u64);
+            send_punishment_log(
+                ctx,
+                guild,
+                "Mensagens removidas",
+                &format!(
+                    "Canal <#{}> (`{}`)",
+                    command.channel_id, command.channel_id
+                ),
+                &audit_actor_label(&command.user),
+                "Limpeza manual de mensagens.",
+                Some(command.channel_id),
+                &format!(
+                    "Comando manual /clear. Quantidade solicitada: {quantity}. Quantidade removida: {deleted}."
+                ),
+                BLUE,
+            )
+            .await;
             return reply(
                 command,
                 &ctx.http,
-                format!(
-                    "{} mensagens removidas.",
-                    quantity.min(messages.len() as u64)
-                ),
+                format!("{deleted} mensagens removidas."),
                 true,
             )
             .await;
@@ -2976,9 +4400,33 @@ async fn command_moderation(
                         },
                     )
                     .await?;
+                send_punishment_log(
+                    ctx,
+                    guild,
+                    "Canal bloqueado",
+                    &format!("Canal <#{}> (`{}`)", channel, channel),
+                    &audit_actor_label(&command.user),
+                    "Bloqueio manual do canal.",
+                    Some(command.channel_id),
+                    &format!("Comando manual /lock. Canal afetado: <#{}>.", channel),
+                    BLUE,
+                )
+                .await;
                 return reply(command, &ctx.http, "Canal bloqueado.", true).await;
             }
             channel.delete_permission(&ctx.http, everyone).await?;
+            send_punishment_log(
+                ctx,
+                guild,
+                "Canal desbloqueado",
+                &format!("Canal <#{}> (`{}`)", channel, channel),
+                &audit_actor_label(&command.user),
+                "Desbloqueio manual do canal.",
+                Some(command.channel_id),
+                &format!("Comando manual /unlock. Canal afetado: <#{}>.", channel),
+                BLUE,
+            )
+            .await;
             return reply(command, &ctx.http, "Canal desbloqueado.", true).await;
         }
         _ => {}
@@ -3127,12 +4575,203 @@ fn list_mutate(list: &mut Vec<String>, action: Option<&str>, value: Option<&str>
     }
 }
 
+async fn require_verified(ctx: &Context, component: &ComponentInteraction) -> BotResult<bool> {
+    let Some(guild_id) = component.guild_id else {
+        component_reply(component, &ctx.http, "Use este painel em um servidor.").await?;
+        return Ok(false);
+    };
+    let member = guild_id.member(&ctx.http, component.user.id).await?;
+    if member.roles.contains(&RoleId::new(VERIFIED_ROLE_ID)) {
+        return Ok(true);
+    }
+    component_reply(
+        component,
+        &ctx.http,
+        "Você precisa estar verificado para receber cargos de cor ou tecnologia.",
+    )
+    .await?;
+    Ok(false)
+}
+
+async fn update_technology_roles(
+    ctx: &Context,
+    component: &ComponentInteraction,
+    selected_roles: &[RoleId],
+) -> BotResult<()> {
+    let Some(guild_id) = component.guild_id else {
+        return component_reply(component, &ctx.http, "Use este painel em um servidor.").await;
+    };
+    let roles = guild_id.roles(&ctx.http).await?;
+    if selected_roles
+        .iter()
+        .any(|role_id| !roles.contains_key(role_id))
+    {
+        return component_reply(
+            component,
+            &ctx.http,
+            "Um ou mais cargos de tecnologia não estão mais disponíveis.",
+        )
+        .await;
+    }
+
+    let member = guild_id.member(&ctx.http, component.user.id).await?;
+    let technology_roles = TECHNOLOGY_ROLE_IDS
+        .iter()
+        .map(|(_, role_id)| RoleId::new(*role_id))
+        .collect::<Vec<_>>();
+    for role_id in &technology_roles {
+        if !selected_roles.contains(role_id) && member.roles.contains(role_id) {
+            member.remove_role(&ctx.http, *role_id).await?;
+        }
+    }
+    for role_id in selected_roles {
+        if !member.roles.contains(role_id) {
+            member.add_role(&ctx.http, *role_id).await?;
+        }
+    }
+    component_reply(component, &ctx.http, "Cargos de tecnologia atualizados.").await
+}
+
 async fn handle_component(
     ctx: &Context,
     state: &Arc<State>,
     component: &ComponentInteraction,
 ) -> BotResult<()> {
     let id = component.data.custom_id.as_str();
+    if id.starts_with("panel:verify:") {
+        let Some(guild_id) = component.guild_id else {
+            return component_reply(component, &ctx.http, "Use este painel em um servidor.").await;
+        };
+        let roles = guild_id.roles(&ctx.http).await?;
+        let role = roles.get(&RoleId::new(VERIFIED_ROLE_ID));
+        let Some(role) = role else {
+            return component_reply(
+                component,
+                &ctx.http,
+                format!("O cargo de verificado (`{VERIFIED_ROLE_ID}`) não foi encontrado."),
+            )
+            .await;
+        };
+        let member = guild_id.member(&ctx.http, component.user.id).await?;
+        if member.roles.contains(&role.id) {
+            return component_reply(component, &ctx.http, "Você já possui o cargo `Membro`.").await;
+        }
+        member.add_role(&ctx.http, role.id).await?;
+        return component_reply(
+            component,
+            &ctx.http,
+            "Verificação concluída. O cargo `Membro` foi entregue.",
+        )
+        .await;
+    }
+    if id == "panel:tech" {
+        if !require_verified(ctx, component).await? {
+            return Ok(());
+        }
+        let values = match &component.data.kind {
+            ComponentInteractionDataKind::StringSelect { values } => values,
+            _ => {
+                return component_reply(component, &ctx.http, "Seleção de tecnologias inválida.")
+                    .await;
+            }
+        };
+        let mut selected_roles = Vec::with_capacity(values.len());
+        for value in values {
+            let role_id = value
+                .parse::<u64>()
+                .ok()
+                .map(RoleId::new)
+                .filter(|role_id| {
+                    TECHNOLOGY_ROLE_IDS
+                        .iter()
+                        .any(|(_, known_id)| RoleId::new(*known_id) == *role_id)
+                });
+            let Some(role_id) = role_id else {
+                return component_reply(component, &ctx.http, "Cargo de tecnologia inválido.")
+                    .await;
+            };
+            selected_roles.push(role_id);
+        }
+        return update_technology_roles(ctx, component, &selected_roles).await;
+    }
+    if let Some(key) = id.strip_prefix("panel:tech:") {
+        if !require_verified(ctx, component).await? {
+            return Ok(());
+        }
+        let Some(role_id) =
+            panel_technology(key).and_then(|technology| technology_role_id(technology.key))
+        else {
+            return component_reply(component, &ctx.http, "Tecnologia não encontrada.").await;
+        };
+        return update_technology_roles(ctx, component, &[role_id]).await;
+    }
+    if id == "panel:colors" {
+        let Some(guild_id) = component.guild_id else {
+            return component_reply(component, &ctx.http, "Use este painel em um servidor.").await;
+        };
+        if !require_verified(ctx, component).await? {
+            return Ok(());
+        }
+        let roles = guild_id.roles(&ctx.http).await?;
+        let selected_id = match &component.data.kind {
+            ComponentInteractionDataKind::StringSelect { values } => values
+                .first()
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(RoleId::new),
+            _ => None,
+        };
+        let color_roles = COLOR_ROLE_NAMES
+            .iter()
+            .filter_map(|name| {
+                roles
+                    .values()
+                    .find(|role| role.name.eq_ignore_ascii_case(name))
+                    .map(|role| role.id)
+            })
+            .collect::<Vec<_>>();
+        let member = guild_id.member(&ctx.http, component.user.id).await?;
+        for role_id in color_roles {
+            if Some(role_id) != selected_id && member.roles.contains(&role_id) {
+                let _ = member.remove_role(&ctx.http, role_id).await;
+            }
+        }
+        if let Some(selected_id) = selected_id {
+            if !roles.contains_key(&selected_id) {
+                return component_reply(component, &ctx.http, "Essa cor não está mais disponível.")
+                    .await;
+            }
+            member.add_role(&ctx.http, selected_id).await?;
+            return component_reply(component, &ctx.http, "Sua cor foi atualizada.").await;
+        }
+        return component_reply(component, &ctx.http, "Suas cores foram removidas.").await;
+    }
+    if let Some(owner_id) = id.strip_prefix("help:category:") {
+        let owner_id = owner_id.parse::<u64>().ok().map(UserId::new);
+        if owner_id != Some(component.user.id) {
+            return component_reply(
+                component,
+                &ctx.http,
+                "Apenas o autor deste painel pode interagir com o menu de ajuda.",
+            )
+            .await;
+        }
+
+        let category = match &component.data.kind {
+            ComponentInteractionDataKind::StringSelect { values } => {
+                values.first().map(String::as_str).unwrap_or_default()
+            }
+            _ => "",
+        };
+        let can_see_admin_commands = component
+            .member
+            .as_ref()
+            .and_then(|member| member.permissions)
+            .map(|permissions| permissions.contains(Permissions::ADMINISTRATOR))
+            .unwrap_or(false);
+        let panel = help_category_panel(component.user.id, can_see_admin_commands, category);
+        send_components_v2_interaction(&ctx.http, component.id, &component.token, 7, panel).await?;
+        return Ok(());
+    }
     if let Some(action) = id.strip_prefix("blackjack:") {
         let Some(guild_id) = component.guild_id else {
             return component_reply(component, &ctx.http, "Use este jogo em um servidor.").await;
@@ -3238,9 +4877,7 @@ async fn handle_component(
             return component_reply(component, &ctx.http, "Use este painel em um servidor.").await;
         };
         let roles = guild_id.roles(&ctx.http).await?;
-        let role = roles.values().find(|role| {
-            role.name.eq_ignore_ascii_case("Membro") || role.name.eq_ignore_ascii_case("verificado")
-        });
+        let role = roles.get(&RoleId::new(VERIFIED_ROLE_ID));
         if let Some(role) = role {
             guild_id
                 .member(&ctx.http, component.user.id)
@@ -3252,22 +4889,28 @@ async fn handle_component(
         return component_reply(
             component,
             &ctx.http,
-            "Crie um cargo chamado `Membro` ou `verificado` para habilitar a verificação.",
+            format!("O cargo de verificado (`{VERIFIED_ROLE_ID}`) não foi encontrado."),
         )
         .await;
     }
     if let Some(technology) = id.strip_prefix("tech:") {
-        return component_reply(
-            component,
-            &ctx.http,
-            format!("Tecnologia selecionada: **{technology}**."),
-        )
-        .await;
+        if !require_verified(ctx, component).await? {
+            return Ok(());
+        }
+        let Some(role_id) =
+            panel_technology(technology).and_then(|technology| technology_role_id(technology.key))
+        else {
+            return component_reply(component, &ctx.http, "Tecnologia não encontrada.").await;
+        };
+        return update_technology_roles(ctx, component, &[role_id]).await;
     }
     if let Some(color) = id.strip_prefix("color:") {
         let Some(guild_id) = component.guild_id else {
             return component_reply(component, &ctx.http, "Use este painel em um servidor.").await;
         };
+        if !require_verified(ctx, component).await? {
+            return Ok(());
+        }
         let roles = guild_id.roles(&ctx.http).await?;
         let Some(selected) = roles
             .values()
@@ -3314,24 +4957,6 @@ async fn handle_component(
     }
     if id.starts_with("poll:") {
         return component_reply(component, &ctx.http, "Voto registrado nesta enquete.").await;
-    }
-    if let Some(background) = id.strip_prefix("profile:bg:") {
-        let Some(guild_id) = component.guild_id else {
-            return component_reply(component, &ctx.http, "Use este perfil em um servidor.").await;
-        };
-        let mut profile = state.db().profile(
-            &guild_id.to_string(),
-            &component.user.id.to_string(),
-            &component.user.name,
-        )?;
-        profile.profile_background = background.to_string();
-        state.db().save_profile(&profile)?;
-        return component_reply(
-            component,
-            &ctx.http,
-            format!("Fundo alterado para **{background}**."),
-        )
-        .await;
     }
     if let Some(action) = id.strip_prefix("reel:") {
         return component_reply(
@@ -3417,6 +5042,87 @@ async fn component_reply(
     Ok(())
 }
 
+fn audit_actor_label(user: &User) -> String {
+    format!("{} — {} (`{}`)", user.mention(), user.name, user.id)
+}
+
+async fn audit_user_label(http: &Http, user_id: UserId) -> String {
+    match http.get_user(user_id).await {
+        Ok(user) => audit_actor_label(&user),
+        Err(_) => format!("<@{}> (`{}`)", user_id, user_id),
+    }
+}
+
+fn audit_automated_actor(state: &Arc<State>) -> String {
+    let bot_id = *state.bot_id.lock().expect("bot id mutex poisoned");
+    bot_id.map_or_else(
+        || "LarperBot (automatico)".to_string(),
+        |id| format!("LarperBot (automatico) (`{id}`)"),
+    )
+}
+
+async fn send_punishment_log(
+    ctx: &Context,
+    guild_id: GuildId,
+    action: &str,
+    target: &str,
+    executor: &str,
+    reason: &str,
+    source_channel: Option<ChannelId>,
+    details: &str,
+    color: u32,
+) {
+    let source = source_channel.map_or_else(
+        || "Nao informado (evento de auditoria)".to_string(),
+        |channel| format!("<#{}> (`{}`)", channel, channel),
+    );
+    let embed = CreateEmbed::new()
+        .title(format!("Log de punicao • {action}"))
+        .description(format!(
+            "**Resultado:** Aplicada\n**Servidor:** `{}`\n**Horario:** <t:{}:F>",
+            guild_id,
+            now()
+        ))
+        .field("Alvo", truncate(target, 1024), false)
+        .field("Executor", truncate(executor, 1024), false)
+        .field(
+            "Motivo",
+            truncate(
+                if reason.trim().is_empty() {
+                    "Sem motivo informado"
+                } else {
+                    reason
+                },
+                1024,
+            ),
+            false,
+        )
+        .field("Origem", source, false)
+        .field(
+            "Detalhes",
+            truncate(
+                if details.trim().is_empty() {
+                    "Nenhum detalhe adicional."
+                } else {
+                    details
+                },
+                1024,
+            ),
+            false,
+        )
+        .color(color);
+
+    if let Err(error) = ChannelId::new(PUNISHMENT_LOG_CHANNEL_ID)
+        .send_message(&ctx.http, CreateMessage::new().embed(embed))
+        .await
+    {
+        error!(
+            "Falha ao enviar log de punicao para o canal {}: {error}",
+            PUNISHMENT_LOG_CHANNEL_ID
+        );
+    }
+}
+
 async fn handle_autocomplete(ctx: &Context, interaction: &CommandInteraction) -> BotResult<()> {
     interaction
         .create_response(
@@ -3430,6 +5136,93 @@ async fn handle_autocomplete(ctx: &Context, interaction: &CommandInteraction) ->
         )
         .await?;
     Ok(())
+}
+
+async fn handle_audit_log_entry(
+    ctx: &Context,
+    state: &Arc<State>,
+    entry: AuditLogEntry,
+    guild_id: GuildId,
+) {
+    let own_bot_action = state
+        .bot_id
+        .lock()
+        .expect("bot id mutex poisoned")
+        .as_ref()
+        .is_some_and(|bot_id| *bot_id == entry.user_id);
+    if own_bot_action {
+        return;
+    }
+
+    let timeout_update = matches!(
+        entry.changes.as_ref(),
+        Some(changes)
+            if changes.iter().any(|change| matches!(
+                change,
+                serenity::model::guild::audit_log::Change::CommunicationDisabledUntil { .. }
+            ))
+    );
+    let (action, color, user_target) = match entry.action {
+        serenity::model::guild::audit_log::Action::Member(
+            serenity::model::guild::audit_log::MemberAction::Kick,
+        ) => ("Expulsao registrada (auditoria)", RED, true),
+        serenity::model::guild::audit_log::Action::Member(
+            serenity::model::guild::audit_log::MemberAction::BanAdd,
+        ) => ("Banimento registrado (auditoria)", RED, true),
+        serenity::model::guild::audit_log::Action::Member(
+            serenity::model::guild::audit_log::MemberAction::BanRemove,
+        ) => ("Banimento removido (auditoria)", BLUE, true),
+        serenity::model::guild::audit_log::Action::Member(
+            serenity::model::guild::audit_log::MemberAction::Update,
+        ) if timeout_update => ("Timeout alterado (auditoria)", BLUE, true),
+        serenity::model::guild::audit_log::Action::Message(
+            serenity::model::guild::audit_log::MessageAction::Delete,
+        ) => ("Mensagem removida (auditoria)", 0xF1C40F, false),
+        serenity::model::guild::audit_log::Action::Message(
+            serenity::model::guild::audit_log::MessageAction::BulkDelete,
+        ) => ("Mensagens removidas (auditoria)", 0xF1C40F, false),
+        _ => return,
+    };
+
+    let target_label = if user_target {
+        match entry.target_id {
+            Some(target_id) => audit_user_label(&ctx.http, UserId::new(target_id.get())).await,
+            None => "Usuario alvo nao informado".to_string(),
+        }
+    } else {
+        entry.target_id.map_or_else(
+            || "Mensagem alvo nao informada".to_string(),
+            |target_id| format!("Mensagem (`{}`)", target_id.get()),
+        )
+    };
+    let executor_label = audit_user_label(&ctx.http, entry.user_id).await;
+    let reason = entry
+        .reason
+        .as_deref()
+        .unwrap_or("Sem motivo informado na auditoria.");
+    let details = format!(
+        "ID da entrada: `{}`. Tipo de acao: `{}`. Opcoes: {:?}. Alteracoes: {:?}.",
+        entry.id,
+        entry.action.num(),
+        entry.options,
+        entry.changes
+    );
+    let source_channel = entry
+        .options
+        .as_ref()
+        .and_then(|options| options.channel_id);
+    send_punishment_log(
+        ctx,
+        guild_id,
+        action,
+        &target_label,
+        &executor_label,
+        reason,
+        source_channel,
+        &details,
+        color,
+    )
+    .await;
 }
 
 async fn automod(ctx: &Context, state: &Arc<State>, message: &Message) -> bool {
@@ -3476,7 +5269,50 @@ async fn automod(ctx: &Context, state: &Arc<State>, message: &Message) -> bool {
         entries.len() as i64 >= settings.spam_limit
     };
     if blocked || mentions || caps || spam {
-        let _ = message.delete(&ctx.http).await;
+        let deleted = message.delete(&ctx.http).await.is_ok();
+        if !deleted {
+            error!(
+                "Falha ao remover mensagem moderada de {} no canal {} do servidor {}.",
+                message.author.id, message.channel_id, guild_id
+            );
+            return true;
+        }
+        let mut triggers = Vec::new();
+        if blocked {
+            triggers.push("palavra ou dominio bloqueado");
+        }
+        if mentions {
+            triggers.push("limite de mencoes excedido");
+        }
+        if caps {
+            triggers.push("excesso de letras maiusculas");
+        }
+        if spam {
+            triggers.push("limite de spam excedido");
+        }
+        let target_label = audit_user_label(&ctx.http, message.author.id).await;
+        let details = format!(
+            "Regras acionadas: {}. Conteudo: {}",
+            triggers.join(", "),
+            if message.content.is_empty() {
+                "(indisponivel)"
+            } else {
+                message.content.as_str()
+            }
+        );
+        let actor_label = audit_automated_actor(state);
+        send_punishment_log(
+            ctx,
+            guild_id,
+            "Mensagem removida (automod)",
+            &target_label,
+            &actor_label,
+            "Mensagem removida automaticamente pelas regras de moderacao.",
+            Some(message.channel_id),
+            &details,
+            0xF1C40F,
+        )
+        .await;
         if let Some(channel) = settings
             .automod_log_channel
             .and_then(|id| id.parse::<u64>().ok())
@@ -3494,12 +5330,129 @@ async fn automod(ctx: &Context, state: &Arc<State>, message: &Message) -> bool {
     false
 }
 
+async fn handle_captcha_message(ctx: &Context, state: &Arc<State>, message: &Message) {
+    let is_own_message = state
+        .bot_id
+        .lock()
+        .expect("bot id mutex poisoned")
+        .as_ref()
+        .is_some_and(|bot_id| *bot_id == message.author.id);
+    if is_own_message {
+        return;
+    }
+
+    let Some(guild_id) = message.guild_id else {
+        return;
+    };
+    match guild_id
+        .ban_with_reason(
+            &ctx.http,
+            message.author.id,
+            1,
+            "Mensagem enviada no canal #captcha protegido contra spam.",
+        )
+        .await
+    {
+        Ok(()) => {
+            let target_label = audit_user_label(&ctx.http, message.author.id).await;
+            let actor_label = audit_automated_actor(state);
+            send_punishment_log(
+                ctx,
+                guild_id,
+                "Banimento automatico (captcha)",
+                &target_label,
+                &actor_label,
+                "Mensagem enviada no canal #captcha protegido contra spam.",
+                Some(message.channel_id),
+                &format!(
+                    "Mensagens removidas: ultimas 24 horas. Conteudo: {}",
+                    if message.content.is_empty() {
+                        "(indisponivel)"
+                    } else {
+                        message.content.as_str()
+                    }
+                ),
+                RED,
+            )
+            .await;
+            info!(
+                "Usuário {} banido por enviar mensagem no canal #captcha do servidor {guild_id}.",
+                message.author.id
+            );
+        }
+        Err(error) => error!(
+            "Falha ao banir {} por mensagem no canal #captcha do servidor {guild_id}: {error}",
+            message.author.id
+        ),
+    }
+}
+
+fn level_role_level(name: &str) -> Option<i64> {
+    let normalized = name.trim().to_lowercase();
+    ["level", "nível", "nivel", "lvl"]
+        .iter()
+        .find_map(|prefix| normalized.strip_prefix(prefix))
+        .map(|suffix| suffix.trim_start_matches([' ', '-', '_']))
+        .filter(|suffix| {
+            !suffix.is_empty() && suffix.chars().all(|character| character.is_ascii_digit())
+        })
+        .and_then(|suffix| suffix.parse::<i64>().ok())
+}
+
+async fn grant_level_role(
+    ctx: &Context,
+    guild_id: GuildId,
+    user_id: UserId,
+    level: i64,
+) -> Option<RoleId> {
+    let roles = match guild_id.roles(&ctx.http).await {
+        Ok(roles) => roles,
+        Err(error) => {
+            debug!("Falha ao carregar cargos de level do servidor {guild_id}: {error}");
+            return None;
+        }
+    };
+    let role_id = roles
+        .values()
+        .find(|role| level_role_level(&role.name) == Some(level))
+        .map(|role| role.id)?;
+    let member = match guild_id.member(&ctx.http, user_id).await {
+        Ok(member) => member,
+        Err(error) => {
+            debug!("Falha ao carregar membro para cargo de level no servidor {guild_id}: {error}");
+            return None;
+        }
+    };
+    if member.roles.contains(&role_id) {
+        return None;
+    }
+    match member.add_role(&ctx.http, role_id).await {
+        Ok(()) => Some(role_id),
+        Err(error) => {
+            debug!("Falha ao entregar cargo de level {role_id} no servidor {guild_id}: {error}");
+            None
+        }
+    }
+}
+
+fn level_up_description(user_mention: &str, level: i64, earned_role: Option<RoleId>) -> String {
+    earned_role
+        .map(|role_id| {
+            format!("Parabéns {user_mention}! Agora você é level {level} e ganhou <@&{role_id}>.")
+        })
+        .unwrap_or_else(|| format!("{user_mention} agora é level {level}!"))
+}
+
 async fn gain_xp(ctx: &Context, state: &Arc<State>, message: &Message) {
     let Some(guild_id) = message.guild_id else {
         return;
     };
-    let Ok(settings) = state.db().settings(&guild_id.to_string()) else {
-        return;
+    let settings = match state.db().settings(&guild_id.to_string()) {
+        Ok(settings) => settings,
+        Err(error) => {
+            error!("Falha ao carregar configuração de XP do servidor {guild_id}: {error}");
+            return;
+        }
     };
     if !settings.level_enabled
         || settings
@@ -3509,41 +5462,58 @@ async fn gain_xp(ctx: &Context, state: &Arc<State>, message: &Message) {
     {
         return;
     }
-    let Ok(mut profile) = state.db().profile(
-        &guild_id.to_string(),
-        &message.author.id.to_string(),
-        &message.author.name,
-    ) else {
-        return;
+    let guild = guild_id.to_string();
+    let user_id = message.author.id.to_string();
+    let mut profile = match state.db().profile(&guild, &user_id, &message.author.name) {
+        Ok(profile) => profile,
+        Err(error) => {
+            error!(
+                "Falha ao carregar perfil de XP de {} no servidor {guild}: {error}",
+                message.author.name
+            );
+            return;
+        }
     };
-    if now() - profile.last_xp_at < settings.xp_cooldown {
+    if profile.last_xp_at > 0 && now() - profile.last_xp_at < settings.xp_cooldown.max(0) {
         return;
     }
-    let amount =
-        rand::rng().random_range(settings.xp_min.max(1)..=settings.xp_max.max(settings.xp_min));
+    let minimum = settings.xp_min.max(1);
+    let maximum = settings.xp_max.max(minimum);
+    let amount = rand::rng().random_range(minimum..=maximum);
     let old_level = level_from_xp(profile.total_xp);
     profile.total_xp += amount;
     profile.weekly_xp += amount;
     profile.monthly_xp += amount;
     profile.last_xp_at = now();
-    let _ = state.db().save_profile(&profile);
+    if let Err(error) = state.db().save_profile(&profile) {
+        error!(
+            "Falha ao salvar XP de {} no servidor {guild}: {error}",
+            message.author.name
+        );
+        return;
+    }
+    debug!(
+        "XP concedido: usuário={} servidor={guild} quantidade={amount} total={}",
+        message.author.name, profile.total_xp
+    );
     let new_level = level_from_xp(profile.total_xp);
-    if new_level > old_level {
-        if let Some(channel) = settings
-            .level_channel
-            .and_then(|id| id.parse::<u64>().ok())
-            .map(ChannelId::new)
-        {
-            let _ = channel
-                .say(
-                    &ctx.http,
-                    format!(
-                        "Parabéns {}, você alcançou o nível **{new_level}**!",
-                        message.author.mention()
-                    ),
-                )
-                .await;
-        }
+    if new_level <= old_level {
+        return;
+    }
+    let earned_role = grant_level_role(ctx, guild_id, message.author.id, new_level).await;
+    if let Some(channel) = settings
+        .level_channel
+        .and_then(|id| id.parse::<u64>().ok())
+        .map(ChannelId::new)
+    {
+        let user_mention = message.author.mention().to_string();
+        let description = level_up_description(&user_mention, new_level, earned_role);
+        let _ = channel
+            .send_message(
+                &ctx.http,
+                CreateMessage::new().embed(CreateEmbed::new().description(description)),
+            )
+            .await;
     }
 }
 
@@ -3585,14 +5555,25 @@ async fn handle_prefix(
         "ping" => {
             message.channel_id.say(&ctx.http, "Pong! 🏓").await?;
         }
-        "help" => {
-            message
-                .channel_id
-                .say(
-                    &ctx.http,
-                    "Use os slash commands do LarperBot; `/help` lista todas as funções.",
-                )
+        "help" | "ajuda" | "h" => {
+            let query = args
+                .first()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty());
+            let can_see_admin_commands = message
+                .member
+                .as_ref()
+                .and_then(|member| member.permissions)
+                .map(|permissions| permissions.contains(Permissions::ADMINISTRATOR))
+                .unwrap_or(false);
+            let panel = query
+                .map(|value| command_help_panel(value, message.author.id, can_see_admin_commands))
+                .unwrap_or_else(|| {
+                    help_home_panel(message.author.id, can_see_admin_commands, state)
+                });
+            send_components_v2_channel(&ctx.http, message.channel_id, panel, Some(message.id))
                 .await?;
+            return Ok(());
         }
         "balance" | "bal" => {
             if let Some(guild) = message.guild_id {
@@ -3698,7 +5679,7 @@ fn level_from_xp(xp: i64) -> i64 {
     level
 }
 fn xp_for_level(level: i64) -> i64 {
-    100 * level * level + 100 * level
+    100 * level * level
 }
 fn format_number(value: f64) -> String {
     if value.fract() == 0.0 {
@@ -3843,9 +5824,12 @@ async fn main() -> BotResult<()> {
         .init();
     let config = Config::from_env()?;
     let db = Db::open(&config.database_path)?;
-    let mut intents = GatewayIntents::GUILDS | GatewayIntents::DIRECT_MESSAGES;
+    let mut intents = GatewayIntents::GUILDS
+        | GatewayIntents::DIRECT_MESSAGES
+        | GatewayIntents::GUILD_MESSAGES
+        | GatewayIntents::GUILD_MODERATION;
     if config.prefix_commands || config.automod || config.levels {
-        intents |= GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
+        intents |= GatewayIntents::MESSAGE_CONTENT;
     }
     if config.member_events {
         intents |= GatewayIntents::GUILD_MEMBERS;
@@ -3857,16 +5841,60 @@ async fn main() -> BotResult<()> {
         spam: Mutex::new(HashMap::new()),
         resume: Mutex::new(HashMap::new()),
         blackjack: Mutex::new(HashMap::new()),
+        bot_id: Mutex::new(None),
     });
+
+    if let Some(uri) = config.mongo_uri.as_deref() {
+        let mut mongo_for_loop = None;
+        let mut cache_loaded = false;
+        match timeout(Duration::from_secs(20), MongoSync::connect(uri)).await {
+            Ok(Ok(mongo)) => {
+                cache_loaded = load_remote_cache(&mongo, &state, "carga inicial").await;
+                if cache_loaded {
+                    push_local_cache(&mongo, &state, "carga inicial").await;
+                } else {
+                    error!(
+                        "Envio inicial ao MongoDB adiado para evitar sobrescrever dados remotos incompletos."
+                    );
+                }
+                mongo_for_loop = Some(mongo);
+                info!(
+                    "Sincronização MongoDB ativada; próximo envio em {} minutos.",
+                    SYNC_INTERVAL.as_secs() / 60
+                );
+            }
+            Ok(Err(error)) => {
+                error!(
+                    "Não foi possível conectar ao MongoDB no start; usando apenas cache local: {error}"
+                );
+            }
+            Err(_) => {
+                error!("Timeout ao conectar ao MongoDB no start; usando apenas cache local.");
+            }
+        }
+        tokio::spawn(mongo_sync_loop(
+            uri.to_string(),
+            Arc::clone(&state),
+            mongo_for_loop,
+            cache_loaded,
+        ));
+    } else {
+        info!(
+            "MONGO_URI não definido; usando SQLite local como cache persistente sem sincronização remota."
+        );
+    }
+
     let mut client = Client::builder(&config.token, intents)
-        .event_handler(Handler { state })
+        .event_handler(Handler {
+            state: Arc::clone(&state),
+        })
         .await?;
 
     let port = http_port()?;
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
     let mut health_server = tokio::spawn(run_health_server(listener));
     info!(
-        "Iniciando LarperBot em Rust; banco SQLite em {}; health check em 0.0.0.0:{port}",
+        "Iniciando LarperBot em Rust; cache local em {}; health check em 0.0.0.0:{port}",
         config.database_path,
     );
 
@@ -3910,11 +5938,198 @@ mod tests {
     }
 
     #[test]
+    fn help_panel_uses_components_v2_container_and_select_menu() {
+        let panel = help_category_panel(UserId::new(42), false, "Informação");
+
+        assert_eq!(panel["type"], 17);
+        assert_eq!(panel["accent_color"], PURPLE);
+        assert_eq!(panel["components"][0]["type"], 10);
+        assert_eq!(panel["components"][1]["type"], 1);
+        assert_eq!(panel["components"][1]["components"][0]["type"], 3);
+        assert_eq!(
+            panel["components"][1]["components"][0]["custom_id"],
+            "help:category:42"
+        );
+    }
+
+    #[test]
+    fn help_hides_admin_commands_and_resolves_node_aliases() {
+        let public_categories = help_categories(false);
+        assert!(public_categories
+            .iter()
+            .all(|(category, _)| *category != "Moderação" && *category != "Boas-vindas"));
+        assert!(help_categories(true)
+            .iter()
+            .any(|(category, _)| *category == "Moderação"));
+        assert_eq!(
+            find_help_command("bal").map(|command| command.name),
+            Some("balance")
+        );
+
+        let details = command_help_panel("balance", UserId::new(42), false);
+        assert!(details["components"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("`bal`"));
+    }
+
+    #[test]
+    fn node_panel_flows_are_components_v2_panels() {
+        let verify = verify_panel(RoleId::new(123));
+        assert_eq!(verify["type"], 17);
+        assert_eq!(
+            verify["components"][1]["components"][0]["custom_id"],
+            "panel:verify:123"
+        );
+
+        let technology = technology_panel(&[]);
+        assert_eq!(technology["type"], 17);
+        assert_eq!(technology["components"].as_array().unwrap().len(), 2);
+        assert_eq!(technology["components"][1]["components"][0]["type"], 3);
+        assert_eq!(
+            technology["components"][1]["components"][0]["custom_id"],
+            "panel:tech"
+        );
+        assert_eq!(
+            technology["components"][1]["components"][0]["min_values"],
+            0
+        );
+        assert_eq!(
+            technology["components"][1]["components"][0]["max_values"],
+            TECHNOLOGY_ROLE_IDS.len()
+        );
+        assert_eq!(
+            technology["components"][1]["components"][0]["options"]
+                .as_array()
+                .unwrap()
+                .len(),
+            TECHNOLOGY_ROLE_IDS.len()
+        );
+        assert_eq!(
+            technology_role_id("typescript"),
+            Some(RoleId::new(1_548_767_613_000_351_834))
+        );
+        assert_eq!(
+            technology_role_id("discord-js"),
+            Some(RoleId::new(1_548_768_351_051_063_346))
+        );
+
+        let colors = colors_panel(Vec::new());
+        assert_eq!(colors["type"], 17);
+        assert_eq!(
+            colors["components"][1]["components"][0]["custom_id"],
+            "panel:colors"
+        );
+    }
+
+    #[test]
+    fn technology_panel_attaches_available_custom_emojis_by_name() {
+        for (technology, emoji) in [
+            ("html", "html"),
+            ("ruby", "ruby"),
+            ("css", "css"),
+            ("svelte", "svelte"),
+            ("sql", "sql"),
+            ("discord-js", "djs"),
+            ("docker", "docker"),
+            ("python", "python"),
+        ] {
+            assert!(technology_emoji_names(technology).contains(&emoji));
+        }
+
+        let emojis = vec![
+            serde_json::from_value::<Emoji>(json!({
+                "id": "101",
+                "name": "csharp",
+                "available": true,
+                "animated": false,
+                "managed": false,
+                "require_colons": true,
+                "roles": [],
+                "user": null,
+            }))
+            .unwrap(),
+            serde_json::from_value::<Emoji>(json!({
+                "id": "103",
+                "name": "typescript",
+                "available": true,
+                "animated": false,
+                "managed": false,
+                "require_colons": true,
+                "roles": [],
+                "user": null,
+            }))
+            .unwrap(),
+            serde_json::from_value::<Emoji>(json!({
+                "id": "102",
+                "name": "rust",
+                "available": false,
+                "animated": false,
+                "managed": false,
+                "require_colons": true,
+                "roles": [],
+                "user": null,
+            }))
+            .unwrap(),
+        ];
+        let panel = technology_panel(&emojis);
+        let options = panel["components"][1]["components"][0]["options"]
+            .as_array()
+            .unwrap();
+        let option = |role_id: u64| {
+            options
+                .iter()
+                .find(|option| option["value"] == role_id.to_string())
+                .unwrap()
+        };
+
+        assert_eq!(option(1_548_767_808_605_782_087)["emoji"]["id"], "101");
+        assert_eq!(
+            option(1_548_767_613_000_351_834)["emoji"]["name"],
+            "typescript"
+        );
+        assert!(option(1_548_767_946_725_483_303)["emoji"].is_null());
+    }
+
+    #[test]
+    fn level_up_descriptions_match_requested_messages() {
+        assert_eq!(
+            level_up_description("<@42>", 3, None),
+            "<@42> agora é level 3!"
+        );
+        assert_eq!(
+            level_up_description("<@42>", 3, Some(RoleId::new(99))),
+            "Parabéns <@42>! Agora você é level 3 e ganhou <@&99>."
+        );
+        assert_eq!(level_role_level("Level 3"), Some(3));
+        assert_eq!(level_role_level("Nível-4"), Some(4));
+        assert_eq!(level_role_level("cargo level"), None);
+    }
+
+    #[test]
+    fn captcha_warning_is_bilingual() {
+        assert!(
+            CAPTCHA_WARNING.contains("Não mande mensagens aqui ou você será retirado do servidor!")
+        );
+        assert!(CAPTCHA_WARNING
+            .contains("Do not send messages here or you will be removed from the server!"));
+    }
+
+    #[test]
     fn duration_accepts_supported_units_and_limit() {
         assert_eq!(parse_duration("10m"), Some(600));
         assert_eq!(parse_duration("2h"), Some(7_200));
         assert_eq!(parse_duration("29d"), None);
         assert_eq!(parse_duration("abc"), None);
+    }
+
+    #[test]
+    fn level_curve_matches_node_profile() {
+        assert_eq!(level_from_xp(99), 0);
+        assert_eq!(level_from_xp(100), 1);
+        assert_eq!(level_from_xp(399), 1);
+        assert_eq!(level_from_xp(400), 2);
+        assert_eq!(xp_for_level(3), 900);
     }
 
     #[test]
@@ -3938,5 +6153,24 @@ mod tests {
         let loaded = db.profile("guild", "user", "Gard").unwrap();
         assert_eq!(loaded.wallet, 500);
         assert_eq!(loaded.inventory[0].item_id, "coffee");
+    }
+
+    #[test]
+    fn sqlite_cache_snapshot_round_trips_profile_data() {
+        let source = Db::open(":memory:").unwrap();
+        let mut profile = source.profile("guild", "user", "Gard").unwrap();
+        profile.total_xp = 230;
+        profile.weekly_xp = 120;
+        profile.monthly_xp = 230;
+        source.save_profile(&profile).unwrap();
+
+        let snapshot = source.cache_snapshot().unwrap();
+        let mut target = Db::open(":memory:").unwrap();
+        assert_eq!(target.restore_cache(&snapshot).unwrap(), 1);
+
+        let restored = target.profile("guild", "user", "Gard").unwrap();
+        assert_eq!(restored.total_xp, 230);
+        assert_eq!(restored.weekly_xp, 120);
+        assert_eq!(restored.monthly_xp, 230);
     }
 }

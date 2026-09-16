@@ -5,8 +5,14 @@ edition = "2021"
 description = "LarperBot em Rust para deploy enxuto na Discloud"
 
 [dependencies]
+ab_glyph = "0.2"
 axum = "0.8"
 dotenvy = "0.15"
+font8x8 = "0.3"
+futures = "0.3"
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+imageproc = { version = "0.25", default-features = false }
+mongodb = "3.9.1"
 rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
